@@ -51,5 +51,3 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 [Run]
 ; 交互式首装:勾选框"立即启动"
 Filename: "{app}\{#MyAppExeName}"; Description: "立即启动程序"; Flags: nowait postinstall skipifsilent
-; 静默(自动更新)安装:装完自动拉起程序
-Filename: "{app}\{#MyAppExeName}"; Flags: nowait runasoriginaluser; Check: WizardSilent

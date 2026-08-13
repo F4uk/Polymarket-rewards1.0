@@ -177,21 +177,6 @@ details.bulk-import textarea { font-family: ui-monospace, Consolas, monospace; f
   opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 1000; font-size: 13px; }
 .app-toast.show { opacity: 1; }
 
-/* --- 自动更新弹窗 --- */
-.update-modal { position: fixed; inset: 0; z-index: 1001; display: flex; align-items: center;
-  justify-content: center; background: var(--overlay); }
-.update-box { background: var(--panel); border-radius: 8px; padding: 24px; width: min(520px, 90vw);
-  box-shadow: 0 8px 32px var(--shadow); }
-.update-box h2 { margin: 0 0 12px; font-size: 18px; }
-.update-notes { max-height: 200px; overflow: auto; white-space: pre-wrap; background: var(--panel2);
-  border-radius: 4px; padding: 10px; font-size: 13px; margin: 0 0 16px; }
-.update-bar { height: 14px; background: var(--rowline); border-radius: 7px; overflow: hidden; }
-#update-bar-fill { height: 100%; width: 0; background: var(--accent); transition: width 0.3s ease; }
-#update-progress-text { font-size: 13px; color: var(--muted); margin: 8px 0 0; }
-.update-error { color: var(--bad); font-size: 13px; margin: 8px 0 0; }
-.update-msg { font-size: 14px; color: var(--text); margin: 0 0 16px; }
-.update-actions { display: flex; gap: 12px; justify-content: flex-end; margin-top: 16px; }
-
 /* --- 通用浮窗(钱包导入确认等) --- */
 .modal-overlay { position: fixed; inset: 0; z-index: 1001; display: flex; align-items: center;
   justify-content: center; background: var(--overlay); }

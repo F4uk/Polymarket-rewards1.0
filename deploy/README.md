@@ -1,7 +1,7 @@
 # VPS 部署说明
 
 把这个程序部署到一台 Linux VPS，通过域名 + HTTPS 远程使用。
-设计背景见 `docs/superpowers/specs/2026-07-27-vps-deployment-design.md`。
+部署与后续维护均由管理员显式执行；运行中应用不会自行更新。
 
 ## 前提
 
@@ -66,18 +66,7 @@ systemctl restart pmm         # 重启(重启后需要重新登录网页)
 
 ## 更新
 
-网页上有「更新」按钮，会 `git fetch` 到最新的 release tag、装依赖、然后退出进程，
-由 systemd 用新代码拉起来。
-
-- 引擎运行中点更新会被拒绝（更新要中断做市，持仓会失去止损保护），先停引擎。
-- 任何一步失败都会自动回滚到原来的版本，进程继续跑，不会把服务搞挂。
-- 万一某个新版本有启动期 bug 导致进程起不来，网页就打不开了，需要 SSH 上去手工回退：
-
-```bash
-cd /opt/pmm/poly-marketmaker
-sudo -u pmm git reset --hard <上一个可用的 tag>
-systemctl restart pmm
-```
+应用不提供网页自更新，也不会自行拉取、重置代码或重装依赖。维护者应在停止引擎后，按自己的变更管理流程手动部署并验证版本。
 
 ## 备份
 

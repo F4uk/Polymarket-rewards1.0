@@ -31,7 +31,7 @@ mkdir -p "$BASE"
 chown -R pmm:pmm "$BASE"
 
 echo "==> 克隆代码"
-# 必须是 git clone(而不是下载 zip):网页上的「更新」按钮靠 git fetch/reset 工作。
+# 使用 git clone 保留可维护的部署工作树；后续更新由管理员显式进行。
 if [ ! -d "$APP/.git" ]; then
 	sudo -H -u pmm git clone "$REPO" "$APP"
 fi

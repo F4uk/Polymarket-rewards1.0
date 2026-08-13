@@ -26,12 +26,10 @@
         <a href="{{ url_for('markets_page') }}" id="scan-indicator" class="scan-indicator" style="display:none"></a>
         <div class="sb-foot">
             <button class="theme-toggle" onclick="toggleTheme()">切换主题</button>
-            <div style="margin-top:10px"><a href="#" onclick="checkForUpdate(this);return false;">检查更新</a></div>
             <div style="margin-top:6px">v{{ app_version }}</div>
             <div style="margin-top:6px"><a href="{{ url_for('logout') }}">退出</a></div>
         </div>
     </nav>
-    {% include "_update_modal.html" %}
     <main class="content">
         {% with messages = get_flashed_messages() %}
         {% if messages %}<div class="flash-messages">{% for msg in messages %}<div class="flash">{{ msg }}</div>{% endfor %}</div>{% endif %}

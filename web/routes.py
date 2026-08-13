@@ -30,7 +30,6 @@ from engine.market_links import enrich_with_market_meta, ensure_market_meta
 from engine.blacklist_ops import buy_order_ids_for_condition
 from engine.take_profit import effective_theta_stop
 from config import DB_PATH, HOST, PORT, SERVER_MODE
-from web import update as updater
 from web.wallet_import import ImportJob, parse_import_lines
 from version import __version__
 
@@ -419,8 +418,6 @@ def api_save_settings():
             "message": "参数已保存。如需立即生效，请重启引擎；否则将在下次启动时生效。",
         }
     )
-
-
 @app.route("/api/categories", methods=["GET"])
 @login_required
 def api_categories():
@@ -448,8 +445,6 @@ def api_list_templates():
             for t in db.list_templates()
         ]
     )
-
-
 @app.route("/api/templates", methods=["POST"])
 @login_required
 def api_create_template():
@@ -524,15 +519,27 @@ def api_set_wallet_template(address):
 @app.route("/api/wallets", methods=["GET"])
 @login_required
 def api_list_wallets():
+    from api.ctf import relayer_configured
+
     wallets = db.list_wallets()
     for w in wallets:
         encrypted_key = w.pop("encrypted_key", None)
         w["running"] = False
         w["balance"] = None
+        w["trading_enabled"] = None
+        w["trading_block_reason"] = ""
+        w["merge_available"] = False
         if manager:
             eng = manager.engines.get(w["address"])
             if eng and eng.running:
                 w["running"] = True
+                w["trading_enabled"] = getattr(eng.api, "trading_enabled", True)
+                w["trading_block_reason"] = getattr(eng.api, "trading_block_reason", "")
+                w["merge_available"] = bool(
+                    w.get("signature_type") == 3
+                    and w["trading_enabled"]
+                    and relayer_configured()
+                )
                 try:
                     w["balance"] = eng.api.get_balance()
                 except Exception:
@@ -547,6 +554,13 @@ def api_list_wallets():
                         w.get("proxy", ""),
                     )
                     w["balance"] = api.get_balance()
+                    w["trading_enabled"] = getattr(api, "trading_enabled", True)
+                    w["trading_block_reason"] = getattr(api, "trading_block_reason", "")
+                    w["merge_available"] = bool(
+                        w.get("signature_type") == 3
+                        and w["trading_enabled"]
+                        and relayer_configured()
+                    )
                 except Exception:
                     pass
     return jsonify(wallets)
@@ -629,10 +643,10 @@ def _import_wallet(raw_key, raw_funder="", raw_proxy="", raw_remark=""):
         PolymarketAPI,
         derive_deposit_address,
         eoa_from_key,
+        expected_type3_deposit_wallet,
         pick_funded_sig_type,
         resolve_signature_type,
     )
-
     # Detect the account type by asking the CLOB which signature type's derived
     # wallet actually holds collateral (EOA=0 / proxy=1 / safe=2 / EIP-1271
     # smart wallet=3). The balance query ignores the funder and derives the
@@ -652,6 +666,21 @@ def _import_wallet(raw_key, raw_funder="", raw_proxy="", raw_remark=""):
         funder = api.get_funder()
         detected = pick_funded_sig_type(api.balance_by_sig_types())
         sig_type = detected if detected is not None else provisional
+        if sig_type == 3:
+            expected = expected_type3_deposit_wallet(private_key)
+            if funder and funder.lower() != expected.lower():
+                raise WalletImportError(
+                    "Type3 存款钱包与官方 Relayer 推导地址不一致；已拒绝保存"
+                )
+            funder = expected
+            api = PolymarketAPI(
+                private_key,
+                signature_type=3,
+                funder=funder,
+                proxy=proxy or None,
+            )
+            if not api.trading_enabled:
+                raise WalletImportError(api.trading_block_reason)
     except Exception as e:
         raise WalletImportError(f"私钥无效: {e}")
 
@@ -878,8 +907,6 @@ def api_scan_status():
             "last_scan_time": manager.last_scan_time,
         }
     )
-
-
 @app.route("/api/engine/place-orders", methods=["POST"])
 @login_required
 def api_place_orders():
@@ -1187,8 +1214,6 @@ def api_eligible_markets():
             "scan_total": manager.scan_total,
         }
     )
-
-
 @app.route("/api/markets/<market_id>/ladder", methods=["GET"])
 @login_required
 def api_market_ladder(market_id):
@@ -1327,8 +1352,6 @@ def _ladder_payload(market_id):
             "placement_mode": "gap_single",
         }
     )
-
-
 @app.route("/api/pnl", methods=["GET"])
 @login_required
 def api_pnl():
@@ -1369,8 +1392,7 @@ def api_pnl():
             "cumulative_net": cumulative_net,
         }
     )
-
-
+# End of routes.
 # --- API: Dashboard Summary ---
 
 
@@ -1453,30 +1475,3 @@ def api_dashboard():
             "templates_without_tiers": templates_without_tiers,
         }
     )
-
-
-# --- API: 自动更新(check 免登录,apply/status 需登录) ---
-# check 只读固定 GitHub URL 的版本号,带 30 分钟 TTL 缓存,不改变任何状态也不
-# 泄露钱包信息,登录页/设置页底部的"检查更新"链接需要它在未登录时也能用;
-# apply(拉代码+重启进程)和 status 会影响进程/暴露运行状态,必须登录后才能用。
-
-
-@app.route("/api/update/check", methods=["GET"])
-def api_update_check():
-    result = updater.check_update()
-    # apply 需要登录;未登录时前端不该展示"现在更新"按钮(点了也只会被重定向)
-    result["logged_in"] = bool(session.get("logged_in"))
-    return jsonify(result)
-
-
-@app.route("/api/update/apply", methods=["POST"])
-@login_required
-def api_update_apply():
-    result = updater.start_update(manager)
-    return jsonify(result), (200 if result.get("ok") else 409)
-
-
-@app.route("/api/update/status", methods=["GET"])
-@login_required
-def api_update_status():
-    return jsonify(updater.STATE.snapshot())

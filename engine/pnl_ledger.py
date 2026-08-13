@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from py_clob_client_v2.clob_types import TradeParams
 from engine.fills import extract_fills
-from engine.pnl import reward_rebate_by_day, realized_pnl_by_day, our_traded_assets
+from engine.pnl import reward_rebate_by_day, realized_pnl_by_day, our_traded_assets, beijing_day
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +40,39 @@ def rebuild_wallet_pnl(api, db, wallet, from_date, to_date):
         len(activity),
         len(trades),
     )
+    confirmed_merges = db.get_confirmed_merges(wallet)
+    merges_by_asset: dict[str, list[dict]] = {}
+    for operation in confirmed_merges:
+        confirmed_at = operation.get("confirmed_at") or operation.get("created_at") or 0
+        for consumed in operation.get("consumed_lots", []):
+            asset = consumed.get("asset_id")
+            qty = sum(float(lot.get("take", 0) or 0) for lot in consumed.get("lots", []))
+            if asset and qty > 0:
+                merges_by_asset.setdefault(asset, []).append(
+                    {"side": "MERGE", "size": qty, "ts": confirmed_at, "price": 1.0}
+                )
+
     realized: dict = {}
     for asset in our_traded_assets(trades, funder):
-        for d, v in realized_pnl_by_day(extract_fills(trades, funder, asset)).items():
+        for d, v in realized_pnl_by_day(
+            extract_fills(trades, funder, asset), merges_by_asset.get(asset)
+        ).items():
             agg = realized.setdefault(d, {"sell_profit": 0.0, "loss": 0.0, "fee": 0.0})
             agg["sell_profit"] += v["sell_profit"]
             agg["loss"] += v["loss"]
             agg["fee"] += v["fee"]
+
+    # A complete set is one collateral realization, not two independent token
+    # sales.  The per-asset MERGE events above only consume their FIFO queues;
+    # persist the operation-level PnL exactly once on confirmation.
+    for operation in confirmed_merges:
+        d = beijing_day(operation.get("confirmed_at") or operation.get("created_at") or 0)
+        pnl = float(operation.get("realized_pnl", 0) or 0)
+        bucket = realized.setdefault(d, {"sell_profit": 0.0, "loss": 0.0, "fee": 0.0})
+        if pnl >= 0:
+            bucket["sell_profit"] += pnl
+        else:
+            bucket["loss"] += -pnl
 
     for d in _date_range(from_date, to_date):
         r = rr.get(d, {})

@@ -130,6 +130,13 @@ class Database:
                 expires_at REAL NOT NULL,
                 PRIMARY KEY (wallet, market_id)
             );
+            CREATE TABLE IF NOT EXISTS side_pauses (
+                wallet TEXT NOT NULL,
+                market_id TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                PRIMARY KEY (wallet, market_id, token_id)
+            );
             CREATE TABLE IF NOT EXISTS eligible_markets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 market_id TEXT NOT NULL,
@@ -188,6 +195,34 @@ class Database:
                 updated_at REAL NOT NULL DEFAULT (strftime('%s','now')),
                 PRIMARY KEY (wallet, date)
             );
+            CREATE TABLE IF NOT EXISTS merge_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet TEXT NOT NULL,
+                funder TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                yes_asset_id TEXT NOT NULL,
+                no_asset_id TEXT NOT NULL,
+                requested_qty REAL NOT NULL,
+                relayer_id TEXT NOT NULL DEFAULT '',
+                tx_hash TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                realized_pnl REAL,
+                consumed_lots_json TEXT NOT NULL DEFAULT '[]',
+                error TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
+                confirmed_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_merge_operations_wallet_condition
+                ON merge_operations(wallet, condition_id, status);
+            CREATE TABLE IF NOT EXISTS scoring_observations (
+                order_id TEXT PRIMARY KEY,
+                wallet TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                token_id TEXT NOT NULL,
+                local_eligible INTEGER NOT NULL,
+                official_scoring TEXT NOT NULL,
+                checked_at REAL NOT NULL
+            );
         """
         )
         self.conn.commit()
@@ -215,6 +250,13 @@ class Database:
         if "last_active_at" not in cols:
             c.execute(
                 "ALTER TABLE wallets ADD COLUMN last_active_at REAL NOT NULL DEFAULT 0"
+            )
+            self.conn.commit()
+        c.execute("PRAGMA table_info(merge_operations)")
+        merge_cols = {row[1] for row in c.fetchall()}
+        if merge_cols and "consumed_lots_json" not in merge_cols:
+            c.execute(
+                "ALTER TABLE merge_operations ADD COLUMN consumed_lots_json TEXT NOT NULL DEFAULT '[]'"
             )
             self.conn.commit()
         c.execute("PRAGMA table_info(eligible_markets)")
@@ -307,23 +349,6 @@ class Database:
         """读上次持久化的品类计数快照;从没存过返回 None。"""
         c = self.conn.cursor()
         c.execute("SELECT value FROM settings WHERE key = ?", ("category_catalog",))
-        row = c.fetchone()
-        return json.loads(row["value"]) if row else None
-
-    def set_last_push_week(self, week_key: str):
-        """持久化周报「上次推送的本周周一日期」(保留键,不进 get_settings 的 ENGINE_DEFAULTS)。
-        重启后据此判断本周是否已推,避免每次启动引擎都重复推。"""
-        c = self.conn.cursor()
-        c.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-            ("last_push_week", json.dumps(week_key)),
-        )
-        self.conn.commit()
-
-    def get_last_push_week(self):
-        """读上次周报推送的周键(本周周一日期);从没推过返回 None。"""
-        c = self.conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key = ?", ("last_push_week",))
         row = c.fetchone()
         return json.loads(row["value"]) if row else None
 
@@ -732,6 +757,113 @@ class Database:
         if row is None:
             return False
         return time.time() < row["expires_at"]
+
+    # Token-side fill guards.  Existing condition cooldowns remain readable for
+    # old databases and scanner compatibility, but new fill handling uses this
+    # table so a YES fill never pauses its complement NO quote.
+    def set_side_pause(self, wallet: str, market_id: str, token_id: str, minutes: int):
+        expires_at = time.time() + int(minutes or 0) * 60
+        c = self.conn.cursor()
+        c.execute(
+            "INSERT OR REPLACE INTO side_pauses (wallet, market_id, token_id, expires_at) VALUES (?, ?, ?, ?)",
+            (wallet, market_id, token_id, expires_at),
+        )
+        self.conn.commit()
+
+    def is_side_paused(self, wallet: str, market_id: str, token_id: str) -> bool:
+        c = self.conn.cursor()
+        c.execute(
+            "SELECT expires_at FROM side_pauses WHERE wallet = ? AND market_id = ? AND token_id = ?",
+            (wallet, market_id, token_id),
+        )
+        row = c.fetchone()
+        return bool(row and time.time() < row["expires_at"])
+
+    # --- Merge operations and scoring observations ---
+
+    def create_merge_operation(self, wallet, funder, condition_id, yes_asset_id, no_asset_id, requested_qty):
+        c = self.conn.cursor()
+        c.execute(
+            """INSERT INTO merge_operations
+            (wallet, funder, condition_id, yes_asset_id, no_asset_id, requested_qty, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'planned')""",
+            (wallet, funder, condition_id, yes_asset_id, no_asset_id, float(requested_qty)),
+        )
+        self.conn.commit()
+        return c.lastrowid
+
+    def update_merge_operation(
+        self,
+        operation_id,
+        status,
+        relayer_id="",
+        tx_hash="",
+        error="",
+        realized_pnl=None,
+        consumed_lots=None,
+    ):
+        c = self.conn.cursor()
+        confirmed_at = time.time() if status == "confirmed" else None
+        c.execute(
+            """UPDATE merge_operations SET status=?, relayer_id=COALESCE(NULLIF(?, ''), relayer_id),
+            tx_hash=COALESCE(NULLIF(?, ''), tx_hash), error=?, realized_pnl=COALESCE(?, realized_pnl),
+            consumed_lots_json=COALESCE(?, consumed_lots_json),
+            confirmed_at=COALESCE(?, confirmed_at) WHERE id=?""",
+            (
+                status,
+                relayer_id,
+                tx_hash,
+                error or "",
+                realized_pnl,
+                json.dumps(consumed_lots) if consumed_lots is not None else None,
+                confirmed_at,
+                operation_id,
+            ),
+        )
+        self.conn.commit()
+
+    def get_unresolved_merges(self, wallet=None):
+        c = self.conn.cursor()
+        query = "SELECT * FROM merge_operations WHERE status IN ('planned', 'submitted')"
+        params = []
+        if wallet:
+            query += " AND wallet = ?"
+            params.append(wallet)
+        query += " ORDER BY id"
+        c.execute(query, params)
+        return [self._hydrate_merge_row(dict(row)) for row in c.fetchall()]
+
+    @staticmethod
+    def _hydrate_merge_row(value):
+        try:
+            value["consumed_lots"] = json.loads(value.pop("consumed_lots_json") or "[]")
+        except (TypeError, ValueError):
+            value["consumed_lots"] = []
+        return value
+
+    def get_confirmed_merges(self, wallet=None):
+        c = self.conn.cursor()
+        query = "SELECT * FROM merge_operations WHERE status = 'confirmed'"
+        params = []
+        if wallet:
+            query += " AND wallet = ?"
+            params.append(wallet)
+        query += " ORDER BY confirmed_at, id"
+        c.execute(query, params)
+        rows = []
+        for row in c.fetchall():
+            rows.append(self._hydrate_merge_row(dict(row)))
+        return rows
+
+    def record_scoring_observation(self, wallet, condition_id, token_id, order_id, local_eligible, official_scoring):
+        c = self.conn.cursor()
+        c.execute(
+            """INSERT OR REPLACE INTO scoring_observations
+            (order_id, wallet, condition_id, token_id, local_eligible, official_scoring, checked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (order_id, wallet, condition_id, token_id, int(bool(local_eligible)), official_scoring, time.time()),
+        )
+        self.conn.commit()
 
     # --- Eligible Markets ---
 

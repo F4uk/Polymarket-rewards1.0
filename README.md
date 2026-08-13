@@ -50,9 +50,9 @@ Built for **non-technical users**: install, double-click, a browser opens, you s
 - **账户净值曲线**：引擎运行期间每个钱包每天记一次净值（现金 + 持仓市值），「资产曲线」页看历史走势，也可查任意某天的净值。
 - **全局黑名单**：在下单 / 扫描 / 监控三处统一拦截不想参与的市场。
 - **私钥本地加密**：钱包私钥用 AES-256-GCM 加密，密钥由你的密码经 PBKDF2（60 万次迭代）派生，仅存在于内存。
-- **GitHub 自动更新**：启动时与最新 Release 比对，弹窗 → 下载校验（SHA-256）→ 静默安装重启。
+- **Merge-first（Type3）**：普通二元市场的已确认 YES+NO 完整集合优先通过官方 Relayer Deposit Wallet 路径合并；缺少 Relayer 配置或 Type3 验证失败时不伪造成功。
 
-> Gap-tier single-rung placement with per-tier modules keyed by the market's minimum reward size (each module carries its own share count and gating thresholds — a market whose minimum size matches no enabled module is never placed), per-wallet strategy templates, position-driven exit that never sells below a cost reconstructed from real fills, a daily net-worth history per wallet, a global blacklist enforced at three choke points, AES-256-GCM encrypted keys held only in memory, and GitHub Release auto-update.
+> Gap-tier single-rung placement with per-tier modules keyed by the market's minimum reward size (each module carries its own share count and gating thresholds — a market whose minimum size matches no enabled module is never placed), per-wallet strategy templates, Merge-first handling for ordinary binary Type3 positions, position-driven exit that never sells below a cost reconstructed from real fills, a daily net-worth history per wallet, a global blacklist enforced at three choke points, and AES-256-GCM encrypted keys held only in memory.
 
 ---
 
@@ -68,7 +68,7 @@ Built for **non-technical users**: install, double-click, a browser opens, you s
 | 历史 | 引擎动作记录（挂买 / 止盈止损卖 / 撤改 / 复查撤单等），含每笔卖单的逐笔成本构成依据 |
 | 资产曲线 | 每个钱包的净值日线（净值 = 现金 + 持仓市值，含现金辅线），可查任意某天的净值明细 |
 | 监控 | 每 4 秒刷新的实时监控快照（瞬时状态） |
-| 配置 | 钱包导入与模板绑定、多模板管理、策略参数、**档位模块卡片编辑器**、引擎参数 |
+| 配置 | 钱包导入与模板绑定、多模板管理、策略参数、**档位模块卡片编辑器**、引擎参数（含 Type3 Merge 可用性状态） |
 | 黑名单 | 加入 / 移除不参与的市场 |
 
 > Eight sidebar screens with a light/dark theme toggle. Market Discovery expands into a live gap-tier preview (which rule the market fell into, per-rung price / book size / risk coefficient, the chosen rung and its share count, plus the reason when nothing is placed). The Config page edits size-tier modules as cards; the Net Worth page charts each wallet's daily balance history.
@@ -155,7 +155,7 @@ pytest tests/test_strategy.py     # 单个文件
 > Auth gates everything (engines can't auto-start). One shared scanner thread feeds per-wallet workers; SQLite is shared across threads. The pipeline is scan → strategy → place → monitor. The gap-tier placement logic in `engine/laddering.py` (plus `engine/strategy.py` and the tier matching in `engine/tiers.py`) is pure, fully unit-tested, and the core IP.
 
 更详细的设计文档（简体中文）见 `docs/superpowers/specs/2026-05-17-polymarket-market-maker-design.md`。
-开发约定与关键不变量见 [`CLAUDE.md`](CLAUDE.md)。
+开发时请以本 README、测试和代码中的安全不变量为准。
 
 ---
 
@@ -195,6 +195,9 @@ pytest tests/test_strategy.py     # 单个文件
 | `take_profit_mode` | `maker` | 浮盈卖法：`maker` 挂卖一吃价差 / `market` 成本 < 买一时立即市价清仓 |
 | `max_exposure_usd` / `max_exposure_shares` | 250 / 500 | 单市场最大敞口（美元 / 份数） |
 | `max_concurrent_markets` | 10 | 最大并发做市市场数 |
+| `low_balance_threshold_usd` | 0 | 低余额市价清仓队列队值；0=关闭（默认） |
+| `merge_enabled` / `merge_min_shares` | `true` / 1.0 | 普通二元 Type3 完整集合合并开关 / 最小份额 |
+| `merge_advantage_min_usd` | 0.01 | 紧急补全 + Merge 相对直接出售的最小优势缓冲 |
 
 **几个概念怎么算 / Key metrics**
 
@@ -220,13 +223,13 @@ powershell -ExecutionPolicy Bypass -File build_installer.ps1
 powershell -ExecutionPolicy Bypass -File release.ps1
 ```
 
-- 版本号唯一来源：`version.py`（被 build / release / 自动更新共同读取）。
+- 版本号唯一来源：`version.py`（被 build / release 读取）。
 - 发版需要已安装并登录的 [GitHub CLI](https://cli.github.com/)（`gh auth login`）。
 - 根目录若存在 `RELEASE_NOTES.md` 则作为 Release 说明，否则自动生成。
-- **发版只出 Windows 安装包**（2026-07-28 起）。Linux 服务器模式不需要安装包，更新走 `git fetch --tags` + `git reset --hard <tag>`，只要 tag 推上去即可。
-- **macOS 已停止构建**：`.github/workflows/build-mac.yml` 的 `release published` 自动触发已移除，只留手动触发（Actions 页填 tag 可给某个 Release 补挂 `.dmg`）。停发对客户端安全——`web/update.py` 的 `parse_release` 在 darwin 上找不到 `.dmg` 时判定「无可用更新」，不会报错。
+- Windows 安装包由发布者手动构建；部署或更新运行中的服务器必须由管理员显式执行，不提供应用内自更新。
+- macOS 构建保持手动触发；客户端不会下载、安装或替换自身源码。
 
-> Single source of version truth is `version.py`. `release.ps1` builds the Windows installer locally; Linux updates itself from the pushed git tag and needs no artifact. macOS builds are no longer published (the workflow keeps a manual trigger only).
+> `version.py` is the single version source. `release.ps1` builds the Windows installer locally; runtime updates are always an explicit administrator action.
 
 ---
 

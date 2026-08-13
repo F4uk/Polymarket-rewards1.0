@@ -47,17 +47,6 @@ ENGINE_DEFAULTS = {
     "reward_scan_max_pages": 20,
 }
 
-# 周报中继(Cloudflare Worker)。Telegram token/chat 只存在 Worker 的环境变量里,客户端
-# 一概不知道。写死在这里的两个值会随源码上 GitHub,**都不是秘密**:
-#   REPORT_URL  Worker 地址,公开可见
-#   REPORT_KEY  只用来把随机扫描 workers.dev 的爬虫挡在门外,不是鉴权凭证
-# 真正的防线是 Worker 侧的 ENABLED 止损开关(设成 "0"、几十秒传播延迟,按下后要发一次测试
-# 请求、收到 503 才算停住,不用发版),以及「改 Worker 不用发版」这件事本身。
-# 历史:上一版把 bot token 写死在这里,被人从公开仓库扒走盗用(2026-07-27),已 revoke。
-REPORT_URL = "https://polymarket-profit.lgldppst.workers.dev"
-REPORT_KEY = "316e1800a8e77780d39523fc77cff12b"
-PUSH_HOUR = 9  # 北京时间几点后推(8点奖励到账之后)
-
 # 策略级参数:每钱包/每模板取值,存 template_settings 表。
 TEMPLATE_DEFAULTS = {
     "min_reward_usd": 100.0,
@@ -95,11 +84,17 @@ TEMPLATE_DEFAULTS = {
     "max_concurrent_markets": 10,
     # 低余额清仓:余额 < low_balance_threshold_usd(0=关)时按优先级逐笔市价卖持仓腾现金。
     # 档1=市场奖励 < low_reward_threshold_usd、档2=份额 < small_position_shares、档3=按亏损从小到大。
-    "low_balance_threshold_usd": 4.0,
+    "low_balance_threshold_usd": 0.0,
     "low_reward_threshold_usd": 30.0,
     "small_position_shares": 20.0,
     "liquidate_target_mode": "balance",  # "balance"=卖到余额线 | "next_order"=卖到够下一单
     "liquidate_target_usd": 4.0,
+    # Merge-first V1: only ordinary same-condition binary complete sets.
+    "merge_enabled": True,
+    "merge_min_shares": 1.0,
+    # A positive edge prevents routing an emergency exit through a complement
+    # purchase on a merely theoretical improvement.
+    "merge_advantage_min_usd": 0.01,
     # 档位模块:按市场最低奖励份额(rewards_min_size)精确匹配的挂单参数组,取代了
     # 原先的奖励最低份额范围筛选、选档系数门槛与金额数值表(均已下沉到每个档位内)。
     # 每项 {size, enabled, shares, rule1/2/3_min_coeff, gap_high_coeff_sum_min,

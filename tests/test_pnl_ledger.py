@@ -74,3 +74,24 @@ def test_rebuild_activity_uses_reward_rebate_redeem_types():
     # 拉 activity 时限定类型(奖励/返佣/赎回)
     types = api.get_activity.call_args.kwargs.get("types")
     assert set(types) == {"REWARD", "MAKER_REBATE", "REDEEM"}
+
+
+def test_confirmed_merge_is_realized_once_and_consumes_both_asset_queues():
+    api = MagicMock()
+    api.get_funder.return_value = "0xFUND"
+    api.get_activity.return_value = []
+    api.get_trades.return_value = []
+    db = MagicMock()
+    db.get_confirmed_merges.return_value = [
+        {
+            "confirmed_at": _utc_ts(2026, 1, 2),
+            "realized_pnl": 1.2,
+            "consumed_lots": [
+                {"asset_id": "yes", "lots": [{"take": 12}]},
+                {"asset_id": "no", "lots": [{"take": 12}]},
+            ],
+        }
+    ]
+    rebuild_wallet_pnl(api, db, "0xW", "2026-01-02", "2026-01-02")
+    call = db.upsert_daily_pnl.call_args.kwargs
+    assert call["sell_profit"] == 1.2

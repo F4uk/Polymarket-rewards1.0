@@ -29,3 +29,18 @@ def held_side_info(positions: list[dict]):
             value_by_market[cid] = value_by_market.get(cid, 0.0) + size * cur
             shares_by_market[cid] = shares_by_market.get(cid, 0.0) + size
     return held_assets, value_by_market, shares_by_market
+
+
+def positions_by_condition(positions: list[dict]) -> dict[str, list[dict]]:
+    """Group confirmed positive positions without rounding fractional shares."""
+    out: dict[str, list[dict]] = {}
+    for pos in positions or []:
+        try:
+            if float(pos.get("size", 0) or 0) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        cid = str(pos.get("conditionId", "") or "")
+        if cid:
+            out.setdefault(cid, []).append(pos)
+    return out

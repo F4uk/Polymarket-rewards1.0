@@ -151,6 +151,42 @@ def test_concurrent_market_cap_skips_new_markets():
     api.place_limit_buy.assert_not_called()
 
 
+def test_concurrent_market_cap_counts_open_sell_held_and_pending_merge():
+    cases = [
+        ([{"side": "SELL", "market": "X", "asset_id": "X-y", "id": "s1"}], []),
+        ([], [{"conditionId": "X", "asset": "X-y", "size": 1, "curPrice": 0.3}]),
+    ]
+    for orders, positions in cases:
+        worker, api, db = _make_worker(template={"max_concurrent_markets": 1})
+        api.get_open_orders.return_value = orders
+        api.get_user_positions.return_value = positions
+        db.get_unresolved_merges.return_value = []
+        api.get_orderbook.return_value = _ob([(0.30, 300)], [(0.31, 1000)])
+        worker.place_orders([_elig("A", "A-y", "Yes")])
+        api.place_limit_buy.assert_not_called()
+
+    worker, api, db = _make_worker(template={"max_concurrent_markets": 1})
+    db.get_unresolved_merges.return_value = [{"condition_id": "X", "status": "submitted"}]
+    api.get_orderbook.return_value = _ob([(0.30, 300)], [(0.31, 1000)])
+    worker.place_orders([_elig("A", "A-y", "Yes")])
+    api.place_limit_buy.assert_not_called()
+
+
+def test_configured_and_reward_price_ranges_must_intersect():
+    worker, api, _ = _make_worker(template={"min_price_cents": 60, "max_price_cents": 70})
+    api.get_orderbook.return_value = _ob([(0.30, 300)], [(0.31, 1000)])
+    worker.place_orders([_elig("A", "A-y", "Yes")])
+    api.place_limit_buy.assert_not_called()
+
+
+def test_placement_price_stays_inside_fine_tick_intersection():
+    worker, api, _ = _make_worker(template={"min_price_cents": 30.0, "max_price_cents": 30.2})
+    api.get_orderbook.return_value = _ob([(0.300, 300)], [(0.302, 1000)], tick="0.001")
+    worker.place_orders([_elig("A", "A-y", "Yes")])
+    prices = [call.args[1] for call in api.place_limit_buy.call_args_list]
+    assert prices and all(0.300 <= price <= 0.302 for price in prices)
+
+
 def test_idempotent_skips_existing_target_order():
     # 目标单档(0.30 @min_size)已在挂 -> reconcile 判为量价皆符,不撤不重挂。
     worker, api, db = _make_worker()

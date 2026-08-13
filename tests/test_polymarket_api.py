@@ -269,6 +269,7 @@ class TestPositionsPagination:
         params = mock_requests.get.call_args.kwargs["params"]
         assert params.get("user") == "0xfunder"
         assert params.get("limit") == 500
+        assert params.get("sizeThreshold") == 0
 
 
 class TestGetRewardsForMarketNoPartialPayload:

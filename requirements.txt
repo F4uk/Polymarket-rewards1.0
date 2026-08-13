@@ -1,10 +1,10 @@
 flask==3.1.1
-py-clob-client-v2>=0.1.0
-py-builder-relayer-client>=0.0.1
-cryptography>=44.0.0
+py-clob-client-v2==1.1.0
+py-builder-relayer-client==0.0.2
+cryptography==50.0.0
 # 签名走 eth_keys 的 CoinCurve 后端;本来是 py-clob-client-v2 的传递依赖,显式声明
 # 是为了让它在 requirements 里可见——PyInstaller 要按名字整包收(见 MarketMaker.spec)。
-coincurve>=21.0.0
-socksio>=1.0.0
-PySocks>=1.7.1
-waitress>=3.0.0
+coincurve==21.0.0
+socksio==1.0.0
+PySocks==1.7.1
+waitress==3.0.2

@@ -68,7 +68,7 @@ class TestCheckBuyOrders:
 
         api.place_limit_sell.assert_not_called()  # no per-fill sell anymore
         db.record_trade.assert_not_called()  # no trades-table write anymore
-        db.set_cooldown.assert_called_with("0xABC", "mkt1", 20)
+        db.set_side_pause.assert_called_with("0xABC", "mkt1", "tok1", 20)
         api.cancel_orders.assert_called_with(["ord1"])
         action_types = [
             c.kwargs["action_type"] for c in db.record_action.call_args_list
@@ -97,6 +97,35 @@ class TestCheckBuyOrders:
             ]
             monitor.check_buy_orders()
         api.cancel_orders.assert_not_called()  # 单不在挂单 -> 不撤
+
+
+    def test_scoring_shadow_records_true_false_and_unknown_without_mutating_orders(self):
+        monitor, api, db = _make_monitor()
+        orders = [
+            {"id": "yes", "side": "BUY", "market": "m", "asset_id": "y"},
+            {"id": "no", "side": "BUY", "market": "m", "asset_id": "n"},
+            {"id": "other", "side": "SELL", "market": "m", "asset_id": "y"},
+        ]
+        api.are_orders_scoring.return_value = {"yes": True, "no": False}
+        monitor._observe_order_scoring(orders)
+        observed = [call.args[-1] for call in db.record_scoring_observation.call_args_list]
+        assert observed == ["true", "false"]
+        api.cancel_orders.assert_not_called()
+
+        monitor._scoring_checked_at = 0
+        api.are_orders_scoring.side_effect = RuntimeError("offline")
+        monitor._observe_order_scoring(orders)
+        assert [call.args[-1] for call in db.record_scoring_observation.call_args_list[-2:]] == ["unknown", "unknown"]
+        api.cancel_orders.assert_not_called()
+
+    def test_fill_pauses_only_the_filled_token_side(self):
+        monitor, api, db = _make_monitor()
+        monitor._handle_fill(
+            {"asset_id": "yes", "market": "m", "size": 2, "price": 0.3, "order_id": None},
+            set(), set(),
+        )
+        db.set_side_pause.assert_called_once_with("0xABC", "m", "yes", 20)
+        db.set_cooldown.assert_not_called()
 
     def test_partial_fill_writes_no_trade(self):
         monitor, api, db = _make_monitor()
@@ -164,7 +193,7 @@ class TestCheckBuyOrders:
         """If a fill handler op raises, seen-key and watermark must still update."""
         monitor, api, db = _make_monitor()
         api.get_trades.return_value = []
-        db.set_cooldown.side_effect = Exception("boom")
+        db.set_side_pause.side_effect = Exception("boom")
 
         with patch("engine.monitor.select_new_buy_fills") as mock_fills:
             mock_fills.return_value = [
@@ -248,7 +277,7 @@ class TestInitWatermark:
         monitor.init_watermark()  # 启动恢复:预灌 seen
         monitor.check_buy_orders()  # 下一 tick:同一笔旧成交不应再被处理
 
-        db.set_cooldown.assert_not_called()
+        db.set_side_pause.assert_not_called()
         api.cancel_orders.assert_not_called()
         ats = [c.kwargs["action_type"] for c in db.record_action.call_args_list]
         assert "cancel_remainder" not in ats
@@ -265,7 +294,7 @@ class TestInitWatermark:
         api.get_open_orders.return_value = [{"id": "O-new"}]  # 新成交的单仍在挂
         monitor.check_buy_orders()
 
-        db.set_cooldown.assert_called_once()
+        db.set_side_pause.assert_called_once()
         api.cancel_orders.assert_called_once_with(["O-new"])
         ats = [c.kwargs["action_type"] for c in db.record_action.call_args_list]
         assert "cancel_remainder" in ats
@@ -301,7 +330,7 @@ class TestInitWatermark:
         api.get_trades.return_value = [old]  # after 被忽略:无论传不传都返回历史成交
         monitor.init_watermark()
         monitor.check_buy_orders()
-        db.set_cooldown.assert_not_called()
+        db.set_side_pause.assert_not_called()
         api.cancel_orders.assert_not_called()
 
     def test_failed_priming_skips_fills_then_recovers_without_reprocess(self):
@@ -314,13 +343,13 @@ class TestInitWatermark:
         monitor.init_watermark()  # priming 失败
 
         monitor.check_buy_orders()  # 网络仍断:不处理成交(不重放)
-        db.set_cooldown.assert_not_called()
+        db.set_side_pause.assert_not_called()
         api.cancel_orders.assert_not_called()
 
         api.get_trades.side_effect = None
         api.get_trades.return_value = [self._buy_trade("T-old", "O-old")]
         monitor.check_buy_orders()  # 网络恢复:补 priming -> 历史成交进 seen -> 不重放
-        db.set_cooldown.assert_not_called()
+        db.set_side_pause.assert_not_called()
         api.cancel_orders.assert_not_called()
 
 

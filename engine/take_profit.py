@@ -64,23 +64,50 @@ def plan_take_profit(
     return {"action": "replace", "price": want, "size": size, "cancel_ids": ids}
 
 
-def position_cost_with_lots(fills: list[dict], size: float):
-    """当前持仓的加权成本 + 剩余逐笔持仓明细,严格由成交流(买入∪卖出)重建。
+def consume_fifo_lots(lots: list[dict], qty: float) -> tuple[list[dict], float]:
+    """Consume ``qty`` FIFO shares and return (consumed lots, total cost).
 
-    按 ts 正序回放我们在该 token 的全部成交:买入入 FIFO 队列,卖出从最早一笔开始
-    抵消;回放完后队列里剩下的就是当前真实持仓,其加权均价即成本。已卖出的旧买单会被
-    抵消、移出队列,绝不污染成本(老 bug:不看卖出、从新到旧凑 size,会把早已平掉的
-    旧买入当成本,导致按错价亏本市价卖)。重建出的剩余持仓数量必须与 Data API 持仓
-    size 吻合(容差 max(1.0, 0.01*size)),否则成本不可信(成交流相对 Data API 滞后、
-    或外部转入的仓)-> (None, []),由调用方走"跳过+⚠️告警"、下个 tick 自愈。
-    返回 (cost_or_None, lots);lots 形如 {price, take(剩余持仓量), ts, trade_id}。
+    The input lots use the public ``take`` shape returned by
+    :func:`position_cost_with_lots`.  Keeping this tiny helper pure allows a
+    confirmed Merge to persist the exact basis it consumed instead of treating
+    its returned collateral as all profit.
     """
-    if size <= 0 or not fills:
-        return None, []
-    ordered = sorted(fills, key=lambda f: f.get("ts", 0) or 0)
-    lots: list[dict] = []  # FIFO 存货队列,最早的在前
-    for f in ordered:
-        fsize = float(f.get("size", 0) or 0)
+    remaining = float(qty or 0)
+    consumed, total = [], 0.0
+    for lot in lots or []:
+        if remaining <= 1e-9:
+            break
+        available = float(lot.get("take", lot.get("remaining", 0)) or 0)
+        take = min(max(0.0, available), remaining)
+        if take <= 0:
+            continue
+        item = dict(lot)
+        item["take"] = take
+        consumed.append(item)
+        total += float(item.get("price", 0) or 0) * take
+        remaining -= take
+    if remaining > 1e-6:
+        return [], 0.0
+    return consumed, total
+
+
+def remaining_fifo_lots(
+    fills: list[dict], merge_consumptions: list[dict] | None = None
+) -> list[dict]:
+    """Replay buys, sells, and merges into an unvalidated FIFO queue.
+
+    Confirmation accounting needs the pre-merge queue even while the Data API
+    is stale, so it must not depend on the current reported position size.
+    Public callers should still use :func:`position_cost_with_lots`, which
+    validates that reconstructed inventory matches the Data API.
+    """
+    events = list(fills or []) + list(merge_consumptions or [])
+    lots: list[dict] = []
+    for f in sorted(events, key=lambda item: item.get("ts", 0) or 0):
+        try:
+            fsize = float(f.get("size", 0) or 0)
+        except (TypeError, ValueError):
+            continue
         if fsize <= 0:
             continue
         side = str(f.get("side", "")).upper()
@@ -93,7 +120,7 @@ def position_cost_with_lots(fills: list[dict], size: float):
                     "trade_id": f.get("trade_id", ""),
                 }
             )
-        elif side == "SELL":
+        elif side in ("SELL", "MERGE"):
             qty = fsize
             while qty > 1e-9 and lots:
                 lot = lots[0]
@@ -102,6 +129,25 @@ def position_cost_with_lots(fills: list[dict], size: float):
                 qty -= take
                 if lot["remaining"] <= 1e-9:
                     lots.pop(0)
+    return lots
+
+
+def position_cost_with_lots(
+    fills: list[dict], size: float, merge_consumptions: list[dict] | None = None
+):
+    """当前持仓的加权成本 + 剩余逐笔持仓明细,严格由成交流(买入∪卖出)重建。
+
+    按 ts 正序回放我们在该 token 的全部成交:买入入 FIFO 队列,卖出从最早一笔开始
+    抵消;回放完后队列里剩下的就是当前真实持仓,其加权均价即成本。已卖出的旧买单会被
+    抵消、移出队列,绝不污染成本(老 bug:不看卖出、从新到旧凑 size,会把早已平掉的
+    旧买入当成本,导致按错价亏本市价卖)。重建出的剩余持仓数量必须与 Data API 持仓
+    size 吻合(容差 max(1.0, 0.01*size)),否则成本不可信(成交流相对 Data API 滞后、
+    或外部转入的仓)-> (None, []),由调用方走"跳过+⚠️告警"、下个 tick 自愈。
+    返回 (cost_or_None, lots);lots 形如 {price, take(剩余持仓量), ts, trade_id}。
+    """
+    if size <= 0 or not fills:
+        return None, []
+    lots = remaining_fifo_lots(fills, merge_consumptions)
     recon = sum(l["remaining"] for l in lots)
     if recon <= 0:
         return None, []

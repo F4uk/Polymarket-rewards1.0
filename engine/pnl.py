@@ -92,7 +92,7 @@ def our_traded_assets(trades, funder) -> set:
     return assets
 
 
-def realized_pnl_by_day(fills) -> dict:
+def realized_pnl_by_day(fills, merge_events=None) -> dict:
     """单 asset 的 extract_fills(含 fee_rate_bps)-> 按北京日的已实现盈亏。
 
     FIFO 回放：买入入队;卖出从最早买入 lots 对冲,对冲部分已实现盈亏
@@ -105,7 +105,7 @@ def realized_pnl_by_day(fills) -> dict:
     def _bucket(d):
         return out.setdefault(d, {"sell_profit": 0.0, "loss": 0.0, "fee": 0.0})
 
-    ordered = sorted(fills, key=lambda f: f.get("ts", 0) or 0)
+    ordered = sorted(list(fills or []) + list(merge_events or []), key=lambda f: f.get("ts", 0) or 0)
     lots: list = []  # FIFO:[{price, remaining}]
     for f in ordered:
         side = str(f.get("side", "")).upper()

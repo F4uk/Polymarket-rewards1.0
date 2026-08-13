@@ -567,7 +567,7 @@ class MarketScanner:
                 if age is not None and age < new_hours:
                     continue
             if self.db.is_in_cooldown(wallet_address, market.get("condition_id", "")):
-                continue  # 该钱包对此市场仍在冷却(与旧 scan 口径一致)
+                continue  # retains pre-existing/manual cooldown compatibility
             # 档位模块精确匹配:最低份额必须等于某个已启用模块的档位值,否则不做。
             if int(market.get("rewards_min_size", 0) or 0) not in tier_sizes:
                 continue

@@ -31,7 +31,7 @@
     </details>
     <table class="data-table" id="wallet-config-table">
         <thead>
-            <tr><th>地址</th><th>余额</th><th>存款地址</th><th>代理</th><th>备注</th><th>模板</th><th>状态</th><th>操作</th></tr>
+            <tr><th>地址</th><th>余额</th><th>账户类型 / Merge</th><th>存款地址</th><th>代理</th><th>备注</th><th>模板</th><th>状态</th><th>操作</th></tr>
         </thead>
         <tbody id="wallet-config-body"></tbody>
     </table>
@@ -124,6 +124,22 @@
                 <option value="maker">挂卖一做 maker（默认 · 吃价差）</option>
                 <option value="market">浮盈市价卖（成本&lt;买一立即市价清仓）</option>
             </select>
+        </div>
+
+        <h3>Merge-first</h3>
+        <p class="hint" style="color:#888;font-size:12px">仅支持同一普通二元市场的 YES+NO 完整集合；Type3 存款钱包且配置 Relayer 时才会自动提交。完整集合优先合并，不因低余额或止损单边卖出。</p>
+        <div class="form-grid">
+            <div class="form-group">
+                <label><input type="checkbox" name="merge_enabled" style="width:auto"> 启用自动 Merge</label>
+            </div>
+            <div class="form-group">
+                <label>最小 Merge 份数</label>
+                <input type="number" name="merge_min_shares" step="0.001" min="0">
+            </div>
+            <div class="form-group">
+                <label>紧急补全优势下限 (USD)</label>
+                <input type="number" name="merge_advantage_min_usd" step="0.01" min="0">
+            </div>
         </div>
 
         <h3>低余额清仓（腾现金）</h3>
@@ -368,7 +384,8 @@ function loadStrategy(tid) {
         const form = document.getElementById('strategy-form');
         Object.keys(data).forEach(key => {
             const input = form.querySelector(`[name="${key}"]`);
-            if (input) input.value = data[key];
+            if (input && input.type === 'checkbox') input.checked = !!data[key];
+            else if (input) input.value = data[key];
         });
         renderTiers(data.size_tiers || []);
         // checkbox 不能靠上面的 input.value 回填（那只会设 value 属性，不动 checked）
@@ -663,6 +680,7 @@ function loadWallets() {
             <tr>
                 <td title="${w.address}">${w.address.slice(0,6)}...${w.address.slice(-4)}</td>
                 <td>${w.balance != null ? '$' + w.balance.toFixed(2) : '-'}</td>
+                <td title="${escapeHtml(w.trading_block_reason || '')}">${ACCT_TYPES[w.signature_type] || ('sig=' + w.signature_type)}<br><small>${w.signature_type === 3 ? (w.merge_available ? 'Merge 可用' : 'Merge 不可用') : 'Merge 仅 Type3'}</small></td>
                 <td title="${w.funder || ''}">${w.funder ? w.funder.slice(0,6)+'...'+w.funder.slice(-4) : '-'}</td>
                 <td title="${w.proxy || ''}">${proxyLabel(w.proxy)}</td>
                 <td title="${escapeHtml(w.address)}">${escapeHtml(w.remark || '')}</td>

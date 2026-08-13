@@ -333,6 +333,21 @@ class TestOrders:
         db.set_cooldown("0xABC", "mkt1", minutes=20)
         assert db.is_in_cooldown("0xABC", "mkt1") is True
 
+    def test_side_pause_and_merge_ledger_are_persistent(self, db):
+        db.set_side_pause("0xABC", "mkt1", "yes", 20)
+        assert db.is_side_paused("0xABC", "mkt1", "yes") is True
+        assert db.is_side_paused("0xABC", "mkt1", "no") is False
+        op = db.create_merge_operation("0xABC", "0xF", "mkt1", "yes", "no", 12.5)
+        assert db.get_unresolved_merges("0xABC")[0]["id"] == op
+        db.update_merge_operation(op, "submitted", relayer_id="rid", tx_hash="0xtx")
+        db.update_merge_operation(
+            op, "confirmed", realized_pnl=1.25,
+            consumed_lots=[{"asset_id": "yes", "lots": [{"price": 0.3, "take": 12.5}]}],
+        )
+        confirmed = db.get_confirmed_merges("0xABC")
+        assert confirmed[0]["realized_pnl"] == 1.25
+        assert confirmed[0]["consumed_lots"][0]["asset_id"] == "yes"
+
 
 class TestActions:
     def test_record_and_get_action(self, db):
@@ -848,19 +863,6 @@ class TestLiquidationQueries:
         self._seed_eligible(db, "0xC1", 25.0, 5.0)
         self._seed_eligible(db, "0xC2", 40.0, 2.0)
         assert db.get_min_order_cost() == 2.0
-
-
-class TestLastPushWeek:
-    def test_roundtrip_and_default_none(self, db):
-        assert db.get_last_push_week() is None
-        db.set_last_push_week("2026-07-13")
-        assert db.get_last_push_week() == "2026-07-13"
-        db.set_last_push_week("2026-07-20")  # 覆盖
-        assert db.get_last_push_week() == "2026-07-20"
-
-    def test_not_polluting_engine_settings(self, db):
-        db.set_last_push_week("2026-07-13")
-        assert "last_push_week" not in db.get_settings()  # 不进 ENGINE_DEFAULTS 白名单
 
 
 def test_skip_new_markets_defaults():

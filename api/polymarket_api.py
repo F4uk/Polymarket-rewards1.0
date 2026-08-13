@@ -2,6 +2,7 @@
 
 import functools
 import logging
+import os
 import time
 from py_clob_client_v2.client import ClobClient
 from py_clob_client_v2.clob_types import (
@@ -19,6 +20,7 @@ from py_clob_client_v2.clob_types import (
 from eth_account import Account
 from py_builder_relayer_client.builder.derive import derive as _derive_safe
 from py_builder_relayer_client.config import get_contract_config
+from py_builder_relayer_client.client import RelayClient
 from api.proxy import parse_proxy, use_proxy, http_get, install_clob_proxy
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,7 @@ POLYMARKET_HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137  # Polygon mainnet
 SIG_POLY_PROXY = 1  # Email/embedded-login Polymarket Proxy Wallet
 SIG_GNOSIS_SAFE = 2  # Browser-wallet proxy signature type
+SIG_POLY_1271 = 3  # Polymarket Deposit Wallet (EIP-1271)
 
 # POST /books 单次可带的 token 数。实测 500 个仍 HTTP 200(1.78s),1000 与 2000 都是
 # HTTP 400。取 100 留足余量:一批同生共死,批越大一次失败丢的盘口越多。
@@ -120,6 +123,21 @@ def eoa_from_key(private_key: str) -> str:
     return Account.from_key(private_key).address
 
 
+def expected_type3_deposit_wallet(private_key: str, rpc_url: str | None = None) -> str:
+    """Ask the official relayer SDK for the actual POLY_1271 Deposit Wallet.
+
+    This is intentionally not a Safe derivation.  It only needs the owner key
+    to derive/validate the address and sends no order or transaction.
+    """
+    client = RelayClient(
+        os.environ.get("PMM_RELAYER_URL", "https://relayer-v2.polymarket.com"),
+        CHAIN_ID,
+        private_key=private_key,
+        rpc_url=rpc_url or os.environ.get("PMM_POLYGON_RPC_URL") or None,
+    )
+    return client.get_expected_deposit_wallet()
+
+
 def resolve_signature_type(derived_safe: str, funder: str) -> int:
     """Pick the Polymarket signature type for an imported wallet.
 
@@ -178,7 +196,9 @@ class PolymarketAPI:
                 None/空=直连。此后该钱包的所有网络活动都从这个代理 IP 出口。
         """
         self.private_key = private_key
-        self.signature_type = signature_type
+        self.signature_type = int(signature_type)
+        self.trading_enabled = True
+        self.trading_block_reason = ""
         self.proxy_url = parse_proxy(proxy)
         install_clob_proxy()  # 幂等:激活 CLOB(httpx)的按代理选路
         # 构造期的网络调用(create_or_derive_api_key)也必须走该钱包代理。
@@ -199,13 +219,39 @@ class PolymarketAPI:
             # it when no funder is supplied.
             eoa_address = temp_client.get_address()
             # Step 2: Create full client with L2 auth
+            resolved_funder = funder or derive_deposit_address(eoa_address)
             self.client = ClobClient(
                 host=POLYMARKET_HOST,
                 key=private_key,
                 chain_id=CHAIN_ID,
                 creds=api_creds,
-                signature_type=signature_type,
-                funder=funder or derive_deposit_address(eoa_address),
+                signature_type=self.signature_type,
+                funder=resolved_funder,
+            )
+        if self.signature_type == SIG_POLY_1271:
+            if not funder:
+                self.trading_enabled = False
+                self.trading_block_reason = "Type3 requires an explicit Deposit Wallet funder"
+            else:
+                try:
+                    expected = expected_type3_deposit_wallet(private_key)
+                except Exception as exc:  # validation must fail closed
+                    self.trading_enabled = False
+                    self.trading_block_reason = f"Type3 Deposit Wallet validation unavailable: {exc}"
+                else:
+                    if str(funder).lower() != str(expected).lower():
+                        self.trading_enabled = False
+                        self.trading_block_reason = "Type3 funder does not match the expected Deposit Wallet"
+
+    def _require_trading_enabled(self):
+        # Some existing diagnostic/unit paths construct the thin wrapper via
+        # ``object.__new__`` and provide only a mocked CLOB client.  Absence of
+        # the Type3 validation state therefore means legacy-compatible allowed;
+        # a normally constructed Type3 wrapper always has the explicit fields.
+        if not getattr(self, "trading_enabled", True):
+            raise OrderRejected(
+                getattr(self, "trading_block_reason", "")
+                or "Automated trading is disabled"
             )
 
     def get_address(self) -> str:
@@ -344,6 +390,7 @@ class PolymarketAPI:
 
         Returns dict with "orderID" and "status" keys.
         """
+        self._require_trading_enabled()
         order_args = OrderArgs(
             token_id=token_id,
             price=price,
@@ -354,7 +401,11 @@ class PolymarketAPI:
             tick_size=tick_size,
             neg_risk=neg_risk,
         )
-        res = self.client.create_and_post_order(order_args, options, OrderType.GTC)
+        # Reward buys must rest.  The official client serializes this as
+        # ``postOnly`` and rejects a stale snapshot which would cross.
+        res = self.client.create_and_post_order(
+            order_args, options, OrderType.GTC, post_only=True
+        )
         return _check_order_resp(res, "限价买单")
 
     def place_limit_sell(
@@ -375,6 +426,7 @@ class PolymarketAPI:
 
         Returns dict with "orderID" and "status" keys.
         """
+        self._require_trading_enabled()
         order_args = OrderArgs(
             token_id=token_id,
             price=price,
@@ -406,6 +458,7 @@ class PolymarketAPI:
         False here meant stop-loss could never market-sell a negative-risk
         position (2026-06-02 incident).
         """
+        self._require_trading_enabled()
         market_args = MarketOrderArgsV2(
             token_id=token_id,
             amount=float(size),
@@ -419,6 +472,38 @@ class PolymarketAPI:
             market_args, options, OrderType.FAK
         )
         return _check_order_resp(res, "市价卖单")
+
+    def place_complement_fok_buy(
+        self,
+        token_id: str,
+        size: float,
+        limit_price: float,
+        tick_size: str = "0.01",
+        neg_risk: bool | None = None,
+    ) -> dict:
+        """Protected all-or-nothing complement purchase for an urgent merge.
+
+        ``size`` and ``limit_price`` come from executable ask depth.  The SDK's
+        V2 market BUY uses ``amount`` as collateral and ``price`` as the limit;
+        therefore the signed maximum collateral is ``size * limit_price`` and
+        the signed token amount remains exactly ``size``. It is intentionally
+        separate from a reward quote and can never fall back to GTC or a
+        resting order.
+        """
+        self._require_trading_enabled()
+        if size <= 0 or limit_price <= 0 or limit_price >= 1:
+            raise OrderRejected("补全 FOK 的数量或限价无效")
+        args = MarketOrderArgsV2(
+            token_id=token_id,
+            amount=float(size) * float(limit_price),
+            side="BUY",
+            price=float(limit_price),
+        )
+        options = PartialCreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
+        return _check_order_resp(
+            self.client.create_and_post_market_order(args, options, OrderType.FOK),
+            "补全 FOK 买单",
+        )
 
     def place_marketable_limit_sell(
         self,
@@ -434,6 +519,7 @@ class PolymarketAPI:
         (盘口瞬时假跌也卖不穿,自带防错杀)。neg_risk=None 走自动解析(与其它卖单一致,
         防负风险仓卖不出)。
         """
+        self._require_trading_enabled()
         order_args = OrderArgs(
             token_id=token_id,
             price=price,
@@ -479,6 +565,10 @@ class PolymarketAPI:
         """
         return self.client.get_open_orders()
 
+    def get_market(self, condition_id: str) -> dict:
+        """Authenticated CLOB market metadata, including complementary tokens."""
+        return self.client.get_market(condition_id)
+
     def get_trades(self, params: TradeParams = None) -> list:
         """Get trade history for this wallet (auto-paginated)."""
         return self.client.get_trades(params)
@@ -503,7 +593,7 @@ class PolymarketAPI:
             f"{DATA_API_HOST}/positions",
             # limit 抬高单页上限,避免持仓被服务端默认页大小(约 100)静默截断 ->
             # 漏离场/止损(F7)。本 app 并发市场上限 ~10 -> 持仓 ≤~20,500 足够,单请求。
-            params={"user": user_address, "limit": 500},
+            params={"user": user_address, "limit": 500, "sizeThreshold": 0},
             timeout=15,
         )
         resp.raise_for_status()
@@ -818,11 +908,13 @@ _PROXIED_METHODS = (
     "place_limit_sell",
     "place_market_sell",
     "place_marketable_limit_sell",
+    "place_complement_fok_buy",
     "cancel_order",
     "cancel_orders",
     "cancel_all_orders",
     "get_order",
     "get_open_orders",
+    "get_market",
     "get_trades",
     "are_orders_scoring",
     "get_user_positions",

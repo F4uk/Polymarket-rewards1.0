@@ -53,11 +53,13 @@ class WalletWorker:
         wallet_address: str,
         settings: dict,
         on_reward_update=None,
+        encryption_key: bytes = None,
     ):
         self.api = api
         self.db = db
         self.wallet_address = wallet_address
         self.settings = settings
+        self.encryption_key = encryption_key
         self._condition_locks: dict[str, threading.Lock] = {}
         self._condition_locks_guard = threading.Lock()
         self.monitor = OrderMonitor(
@@ -66,6 +68,7 @@ class WalletWorker:
             wallet_address,
             on_reward_update=on_reward_update,
             condition_lock=self._condition_lock,
+            encryption_key=encryption_key,
         )
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -966,6 +969,7 @@ class EngineManager:
             address,
             settings,
             on_reward_update=self.update_market_reward,
+            encryption_key=self.encryption_key,
         )
         self.engines[address] = worker
         worker.start()

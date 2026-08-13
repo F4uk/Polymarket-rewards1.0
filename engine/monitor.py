@@ -53,10 +53,21 @@ _FOK_RECONCILE_GRACE_SEC = 30
 
 
 class OrderMonitor:
-    def __init__(self, api, db, wallet_address: str, on_reward_update=None, condition_lock=None):
+    def __init__(
+        self,
+        api,
+        db,
+        wallet_address: str,
+        on_reward_update=None,
+        condition_lock=None,
+        encryption_key: bytes = None,
+    ):
         self.api = api
         self.db = db
         self.wallet_address = wallet_address
+        # Login-derived key for decrypting stored Relayer credentials.
+        # None keeps legacy ENV-only behavior (and all existing tests).
+        self.encryption_key = encryption_key
         # 实时奖励写回候选池的回调(manager 注入);None=不写回(测试/临时下单 worker)。
         self.on_reward_update = on_reward_update
         # WalletWorker owns the lock registry because placement and monitoring
@@ -375,7 +386,18 @@ class OrderMonitor:
     def _merge_client(self):
         if int(getattr(self.api, "signature_type", -1)) != 3:
             raise RelayerUnavailable("automatic Merge requires a Type3 Deposit Wallet")
-        return Type3MergeClient(self.api.private_key)
+        from api.relayer_config import (
+            RELAYER_NOT_CONFIGURED,
+            load_relayer_runtime_config,
+        )
+
+        config = load_relayer_runtime_config(self.db, self.encryption_key)
+        if config is None:
+            raise RelayerUnavailable(
+                "Relayer credentials are not configured",
+                reason=RELAYER_NOT_CONFIGURED,
+            )
+        return Type3MergeClient(self.api.private_key, relayer_config=config)
 
     @staticmethod
     def _relayer_details(response):

@@ -237,6 +237,20 @@ class Database:
                 official_scoring TEXT NOT NULL,
                 checked_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS relayer_credentials (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                encrypted_api_key TEXT NOT NULL,
+                encrypted_secret TEXT NOT NULL,
+                encrypted_passphrase TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS relayer_test_results (
+                wallet TEXT PRIMARY KEY,
+                last_test_ok INTEGER NOT NULL,
+                last_test_at REAL NOT NULL,
+                last_test_reason TEXT NOT NULL DEFAULT '',
+                deposit_wallet_deployed INTEGER
+            );
         """
         )
         self.conn.commit()
@@ -497,6 +511,107 @@ class Database:
         if row is None:
             return None, None
         return row["password_hash"], row["salt"]
+
+    # --- Relayer credentials (encrypted at rest, app-level) ---
+    # Builder API credentials are application-level secrets, never part of a
+    # wallet/template. The three ciphertext blobs are written as one atomic
+    # unit so a partial update (new key + old secret) can never be persisted.
+
+    def save_relayer_credentials(
+        self,
+        encrypted_api_key: str,
+        encrypted_secret: str,
+        encrypted_passphrase: str,
+        now: float = None,
+    ):
+        """Atomically upsert the single credential row (id=1, CHECK-enforced)."""
+        c = self.conn.cursor()
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            c.execute(
+                """INSERT OR REPLACE INTO relayer_credentials
+                (id, encrypted_api_key, encrypted_secret, encrypted_passphrase, updated_at)
+                VALUES (1, ?, ?, ?, ?)""",
+                (
+                    encrypted_api_key,
+                    encrypted_secret,
+                    encrypted_passphrase,
+                    now if now is not None else time.time(),
+                ),
+            )
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_relayer_credentials(self):
+        c = self.conn.cursor()
+        c.execute(
+            """SELECT encrypted_api_key, encrypted_secret, encrypted_passphrase, updated_at
+            FROM relayer_credentials WHERE id = 1"""
+        )
+        row = c.fetchone()
+        return dict(row) if row else None
+
+    def delete_relayer_credentials(self):
+        c = self.conn.cursor()
+        c.execute("DELETE FROM relayer_credentials WHERE id = 1")
+        self.conn.commit()
+
+    def save_relayer_test_result(
+        self,
+        wallet: str,
+        ok: bool,
+        reason: str,
+        deposit_wallet_deployed=None,
+        at: float = None,
+    ):
+        """Persist a read-only preflight result (display only, never authority)."""
+        c = self.conn.cursor()
+        c.execute(
+            """INSERT OR REPLACE INTO relayer_test_results
+            (wallet, last_test_ok, last_test_at, last_test_reason, deposit_wallet_deployed)
+            VALUES (?, ?, ?, ?, ?)""",
+            (
+                wallet,
+                1 if ok else 0,
+                at if at is not None else time.time(),
+                reason or "",
+                None
+                if deposit_wallet_deployed is None
+                else (1 if deposit_wallet_deployed else 0),
+            ),
+        )
+        self.conn.commit()
+
+    def get_relayer_test_results(self) -> dict:
+        """Return {wallet: {last_test_ok, last_test_at, last_test_reason, ...}}."""
+        c = self.conn.cursor()
+        c.execute(
+            """SELECT wallet, last_test_ok, last_test_at, last_test_reason,
+            deposit_wallet_deployed FROM relayer_test_results"""
+        )
+        out = {}
+        for row in c.fetchall():
+            d = dict(row)
+            d["last_test_ok"] = bool(d["last_test_ok"])
+            d["deposit_wallet_deployed"] = (
+                None
+                if d["deposit_wallet_deployed"] is None
+                else bool(d["deposit_wallet_deployed"])
+            )
+            out[d.pop("wallet")] = d
+        return out
+
+    def delete_relayer_test_results(self):
+        c = self.conn.cursor()
+        c.execute("DELETE FROM relayer_test_results")
+        self.conn.commit()
+
+    def delete_relayer_test_result(self, wallet: str):
+        c = self.conn.cursor()
+        c.execute("DELETE FROM relayer_test_results WHERE wallet = ?", (wallet,))
+        self.conn.commit()
 
     # --- Wallets ---
 

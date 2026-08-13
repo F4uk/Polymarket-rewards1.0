@@ -15,6 +15,13 @@ from py_builder_relayer_client.models import DepositWalletCall, TransactionType
 from py_builder_signing_sdk.config import BuilderConfig
 from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
 
+from api.relayer_config import (
+    RELAYER_NOT_CONFIGURED,
+    RelayerRuntimeConfig,
+    env_relayer_configured,
+    resolve_relayer_config,
+)
+
 
 CHAIN_ID = 137
 # Official ctf-exchange-v2 Polygon ordinary CTF adapter deployment.
@@ -27,12 +34,15 @@ APPROVAL_SIGNATURE = "setApprovalForAll(address,bool)"
 class RelayerUnavailable(RuntimeError):
     """Raised before any transaction request when required credentials are absent."""
 
+    def __init__(self, message, *, reason=RELAYER_NOT_CONFIGURED):
+        super().__init__(message)
+        self.reason = reason
+
 
 def relayer_configured(env=os.environ) -> bool:
-    return all(
-        (env.get(key) or "").strip()
-        for key in ("PMM_RELAYER_URL", "PMM_BUILDER_API_KEY", "PMM_BUILDER_SECRET", "PMM_BUILDER_PASSPHRASE")
-    )
+    """Legacy ENV-only check. The Relayer URL is optional (official default);
+    only the Builder credential trio is required."""
+    return env_relayer_configured(env)
 
 
 def merge_calldata(condition_id: str, amount: float) -> str:
@@ -68,20 +78,37 @@ def merge_approval_calldata() -> str:
 class Type3MergeClient:
     """Official Relayer WALLET-batch execution for a POLY_1271 deposit wallet."""
 
-    def __init__(self, private_key: str, *, env=os.environ, relay_client_cls=RelayClient):
-        if not relayer_configured(env):
-            raise RelayerUnavailable("Relayer credentials are not configured")
+    def __init__(
+        self,
+        private_key: str,
+        *,
+        relayer_config: RelayerRuntimeConfig = None,
+        env=os.environ,
+        relay_client_cls=RelayClient,
+    ):
+        """Explicit ``relayer_config`` wins; otherwise resolve from ENV.
+
+        The config object is injected rather than read from the database or
+        from ``os.environ`` inside funds-moving code.
+        """
+        if relayer_config is None:
+            relayer_config = resolve_relayer_config(None, env=env)
+        if relayer_config is None or not relayer_config.configured:
+            raise RelayerUnavailable(
+                "Relayer credentials are not configured",
+                reason=RELAYER_NOT_CONFIGURED,
+            )
         creds = BuilderApiKeyCreds(
-            key=env["PMM_BUILDER_API_KEY"],
-            secret=env["PMM_BUILDER_SECRET"],
-            passphrase=env["PMM_BUILDER_PASSPHRASE"],
+            key=relayer_config.builder_key,
+            secret=relayer_config.builder_secret,
+            passphrase=relayer_config.builder_passphrase,
         )
         self.client = relay_client_cls(
-            env["PMM_RELAYER_URL"],
+            relayer_config.url,
             CHAIN_ID,
             private_key=private_key,
             builder_config=BuilderConfig(local_builder_creds=creds),
-            rpc_url=(env.get("PMM_POLYGON_RPC_URL") or None),
+            rpc_url=relayer_config.rpc_url,
         )
 
     def expected_deposit_wallet(self) -> str:

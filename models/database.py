@@ -7,6 +7,19 @@ import time
 from config import DEFAULTS, ENGINE_DEFAULTS, TEMPLATE_DEFAULTS
 
 
+class ActiveMergeOperationExists(RuntimeError):
+    """Raised when a wallet/condition already owns a funds-moving Merge."""
+
+    def __init__(self, wallet: str, condition_id: str, operation_id: int | None = None):
+        self.wallet = wallet
+        self.condition_id = condition_id
+        self.operation_id = operation_id
+        suffix = f" (operation {operation_id})" if operation_id is not None else ""
+        super().__init__(
+            f"active Merge already exists for wallet={wallet} condition={condition_id}{suffix}"
+        )
+
+
 class Database:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -210,7 +223,8 @@ class Database:
                 consumed_lots_json TEXT NOT NULL DEFAULT '[]',
                 error TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
-                confirmed_at REAL
+                confirmed_at REAL,
+                inventory_reconciled_at REAL
             );
             CREATE INDEX IF NOT EXISTS idx_merge_operations_wallet_condition
                 ON merge_operations(wallet, condition_id, status);
@@ -259,6 +273,38 @@ class Database:
                 "ALTER TABLE merge_operations ADD COLUMN consumed_lots_json TEXT NOT NULL DEFAULT '[]'"
             )
             self.conn.commit()
+            merge_cols.add("consumed_lots_json")
+        if merge_cols and "inventory_reconciled_at" not in merge_cols:
+            c.execute(
+                "ALTER TABLE merge_operations ADD COLUMN inventory_reconciled_at REAL"
+            )
+            # Rows confirmed before this migration are historical and must not
+            # become permanent inventory barriers merely because the column
+            # did not exist when they completed.
+            c.execute(
+                """UPDATE merge_operations
+                SET inventory_reconciled_at=COALESCE(confirmed_at, created_at)
+                WHERE status='confirmed'"""
+            )
+            self.conn.commit()
+            merge_cols.add("inventory_reconciled_at")
+        # A condition owns its own Merge lifecycle.  The partial unique index
+        # prevents two planned/submitted operations for the same wallet and
+        # condition without imposing a wallet-global serialization policy.
+        #
+        # Very old databases may already contain duplicate active rows.  Do
+        # not rewrite or hide either potentially funds-moving operation during
+        # migration; the BEGIN IMMEDIATE guard in create_merge_operation()
+        # still blocks every new duplicate until an operator reconciles them.
+        try:
+            c.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_merge_active_wallet_condition
+                ON merge_operations(wallet COLLATE NOCASE, condition_id COLLATE NOCASE)
+                WHERE status IN ('planned', 'submitted')"""
+            )
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            self.conn.rollback()
         c.execute("PRAGMA table_info(eligible_markets)")
         em_cols = {row[1] for row in c.fetchall()}
         if em_cols and "min_cost" not in em_cols:
@@ -783,14 +829,61 @@ class Database:
 
     def create_merge_operation(self, wallet, funder, condition_id, yes_asset_id, no_asset_id, requested_qty):
         c = self.conn.cursor()
-        c.execute(
-            """INSERT INTO merge_operations
-            (wallet, funder, condition_id, yes_asset_id, no_asset_id, requested_qty, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'planned')""",
-            (wallet, funder, condition_id, yes_asset_id, no_asset_id, float(requested_qty)),
-        )
-        self.conn.commit()
-        return c.lastrowid
+        try:
+            # Serialize the check+insert across this process and any other
+            # process sharing the SQLite file.  This remains the reliable
+            # fallback for a legacy database whose pre-existing duplicates
+            # prevented creation of the partial unique index above.
+            c.execute("BEGIN IMMEDIATE")
+            c.execute(
+                """SELECT id FROM merge_operations
+                WHERE wallet = ? COLLATE NOCASE
+                  AND condition_id = ? COLLATE NOCASE
+                  AND (status IN ('planned', 'submitted')
+                       OR (status='confirmed' AND inventory_reconciled_at IS NULL)
+                       OR (status='confirmed' AND error LIKE 'FIFO_LEDGER_PENDING:%'))
+                ORDER BY id LIMIT 1""",
+                (wallet, condition_id),
+            )
+            existing = c.fetchone()
+            if existing:
+                raise ActiveMergeOperationExists(wallet, condition_id, int(existing["id"]))
+            c.execute(
+                """INSERT INTO merge_operations
+                (wallet, funder, condition_id, yes_asset_id, no_asset_id, requested_qty, status)
+                VALUES (?, ?, ?, ?, ?, ?, 'planned')""",
+                (wallet, funder, condition_id, yes_asset_id, no_asset_id, float(requested_qty)),
+            )
+            operation_id = c.lastrowid
+            self.conn.commit()
+            return operation_id
+        except ActiveMergeOperationExists:
+            self.conn.rollback()
+            raise
+        except sqlite3.IntegrityError as exc:
+            self.conn.rollback()
+            # A concurrent creator may have won through the partial index
+            # between statements (or the index may be the only guard in a
+            # future implementation).  Present one stable domain error.
+            c.execute(
+                """SELECT id FROM merge_operations
+                WHERE wallet = ? COLLATE NOCASE
+                  AND condition_id = ? COLLATE NOCASE
+                  AND (status IN ('planned', 'submitted')
+                       OR (status='confirmed' AND inventory_reconciled_at IS NULL)
+                       OR (status='confirmed' AND error LIKE 'FIFO_LEDGER_PENDING:%'))
+                ORDER BY id LIMIT 1""",
+                (wallet, condition_id),
+            )
+            existing = c.fetchone()
+            if existing:
+                raise ActiveMergeOperationExists(
+                    wallet, condition_id, int(existing["id"])
+                ) from exc
+            raise
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def update_merge_operation(
         self,
@@ -808,7 +901,7 @@ class Database:
             """UPDATE merge_operations SET status=?, relayer_id=COALESCE(NULLIF(?, ''), relayer_id),
             tx_hash=COALESCE(NULLIF(?, ''), tx_hash), error=?, realized_pnl=COALESCE(?, realized_pnl),
             consumed_lots_json=COALESCE(?, consumed_lots_json),
-            confirmed_at=COALESCE(?, confirmed_at) WHERE id=?""",
+            confirmed_at=COALESCE(confirmed_at, ?) WHERE id=?""",
             (
                 status,
                 relayer_id,
@@ -822,13 +915,16 @@ class Database:
         )
         self.conn.commit()
 
-    def get_unresolved_merges(self, wallet=None):
+    def get_unresolved_merges(self, wallet=None, condition_id=None):
         c = self.conn.cursor()
         query = "SELECT * FROM merge_operations WHERE status IN ('planned', 'submitted')"
         params = []
         if wallet:
-            query += " AND wallet = ?"
+            query += " AND wallet = ? COLLATE NOCASE"
             params.append(wallet)
+        if condition_id:
+            query += " AND condition_id = ? COLLATE NOCASE"
+            params.append(condition_id)
         query += " ORDER BY id"
         c.execute(query, params)
         return [self._hydrate_merge_row(dict(row)) for row in c.fetchall()]
@@ -846,7 +942,7 @@ class Database:
         query = "SELECT * FROM merge_operations WHERE status = 'confirmed'"
         params = []
         if wallet:
-            query += " AND wallet = ?"
+            query += " AND wallet = ? COLLATE NOCASE"
             params.append(wallet)
         query += " ORDER BY confirmed_at, id"
         c.execute(query, params)
@@ -854,6 +950,45 @@ class Database:
         for row in c.fetchall():
             rows.append(self._hydrate_merge_row(dict(row)))
         return rows
+
+    def get_confirmed_pending_merges(self, wallet=None):
+        """Confirmed on-chain operations whose optional FIFO ledger needs retry."""
+        c = self.conn.cursor()
+        query = (
+            "SELECT * FROM merge_operations "
+            "WHERE status='confirmed' AND error LIKE 'FIFO_LEDGER_PENDING:%'"
+        )
+        params = []
+        if wallet:
+            query += " AND wallet = ? COLLATE NOCASE"
+            params.append(wallet)
+        query += " ORDER BY confirmed_at, id"
+        c.execute(query, params)
+        return [self._hydrate_merge_row(dict(row)) for row in c.fetchall()]
+
+    def get_merge_inventory_barriers(self, wallet=None):
+        """Confirmed operations whose Data API consumption is not yet visible."""
+        c = self.conn.cursor()
+        query = (
+            "SELECT * FROM merge_operations "
+            "WHERE status='confirmed' AND inventory_reconciled_at IS NULL"
+        )
+        params = []
+        if wallet:
+            query += " AND wallet = ? COLLATE NOCASE"
+            params.append(wallet)
+        query += " ORDER BY confirmed_at, id"
+        c.execute(query, params)
+        return [self._hydrate_merge_row(dict(row)) for row in c.fetchall()]
+
+    def mark_merge_inventory_reconciled(self, operation_id):
+        c = self.conn.cursor()
+        c.execute(
+            """UPDATE merge_operations SET inventory_reconciled_at=?
+            WHERE id=? AND status='confirmed'""",
+            (time.time(), operation_id),
+        )
+        self.conn.commit()
 
     def record_scoring_observation(self, wallet, condition_id, token_id, order_id, local_eligible, official_scoring):
         c = self.conn.cursor()

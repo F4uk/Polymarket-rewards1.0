@@ -2,7 +2,7 @@
 
 import os
 import pytest
-from models.database import Database
+from models.database import ActiveMergeOperationExists, Database
 
 
 def test_settings_page_engine_strategy_split_roundtrip(tmp_path):
@@ -347,6 +347,84 @@ class TestOrders:
         confirmed = db.get_confirmed_merges("0xABC")
         assert confirmed[0]["realized_pnl"] == 1.25
         assert confirmed[0]["consumed_lots"][0]["asset_id"] == "yes"
+
+    def test_active_merge_is_unique_per_wallet_condition_not_per_wallet(self, db):
+        from models.database import ActiveMergeOperationExists
+
+        first = db.create_merge_operation("0xABC", "0xF", "A", "a-y", "a-n", 5)
+        with pytest.raises(ActiveMergeOperationExists) as exc:
+            db.create_merge_operation("0xabc", "0xF", "a", "a-y", "a-n", 5)
+        assert exc.value.operation_id == first
+
+        # A does not serialize the entire wallet; B owns an independent row.
+        second = db.create_merge_operation("0xABC", "0xF", "B", "b-y", "b-n", 7)
+        assert second != first
+        assert [row["condition_id"] for row in db.get_unresolved_merges("0xabc")] == [
+            "A",
+            "B",
+        ]
+
+        db.update_merge_operation(first, "failed", error="terminal")
+        replacement = db.create_merge_operation("0xABC", "0xF", "A", "a-y", "a-n", 3)
+        assert replacement not in (first, second)
+
+    def test_confirmed_pending_ledger_is_terminal_for_funds_but_queryable(self, db):
+        from models.database import ActiveMergeOperationExists
+
+        op = db.create_merge_operation("0xABC", "0xF", "A", "a-y", "a-n", 5)
+
+        db.update_merge_operation(
+            op,
+            "confirmed",
+            relayer_id="rid",
+            error="FIFO_LEDGER_PENDING: retry",
+        )
+
+        assert db.get_unresolved_merges("0xABC") == []
+        pending = db.get_confirmed_pending_merges("0xabc")
+        assert [row["id"] for row in pending] == [op]
+        assert pending[0]["confirmed_at"] is not None
+
+        # Ledger-pending is terminal for SELL blocking but still owns Merge
+        # idempotency until its accounting journal is complete.
+        with pytest.raises(ActiveMergeOperationExists):
+            db.create_merge_operation("0xABC", "0xF", "a", "a-y", "a-n", 2)
+
+
+def test_legacy_duplicate_active_migration_preserves_rows_and_blocks_new(tmp_path):
+    path = tmp_path / "legacy-duplicate.db"
+    db = Database(str(path))
+    db.init()
+    db.conn.execute("DROP INDEX uq_merge_active_wallet_condition")
+    values = ("0xWallet", "0xFunder", "A", "yes", "no", 5)
+    db.conn.execute(
+        """INSERT INTO merge_operations
+        (wallet, funder, condition_id, yes_asset_id, no_asset_id, requested_qty, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'planned')""",
+        values,
+    )
+    db.conn.execute(
+        """INSERT INTO merge_operations
+        (wallet, funder, condition_id, yes_asset_id, no_asset_id, requested_qty, status)
+        VALUES (?, ?, ?, ?, ?, ?, 'submitted')""",
+        values,
+    )
+    db.conn.commit()
+    db.close()
+
+    reopened = Database(str(path))
+    reopened.init()  # unique-index creation fails closed; no active row is rewritten
+    assert len(reopened.get_unresolved_merges("0xwallet", "a")) == 2
+    with pytest.raises(ActiveMergeOperationExists):
+        reopened.create_merge_operation(
+            "0xWallet", "0xFunder", "A", "yes", "no", 5
+        )
+    index = reopened.conn.execute(
+        """SELECT name FROM sqlite_master
+        WHERE type='index' AND name='uq_merge_active_wallet_condition'"""
+    ).fetchone()
+    assert index is None
+    reopened.close()
 
 
 class TestActions:

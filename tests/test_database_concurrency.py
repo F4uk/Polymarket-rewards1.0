@@ -8,7 +8,7 @@
 
 import threading
 
-from models.database import Database
+from models.database import ActiveMergeOperationExists, Database
 
 
 def test_get_template_for_thread_safe_under_write_contention(tmp_path):
@@ -72,3 +72,44 @@ def test_get_template_for_thread_safe_under_write_contention(tmp_path):
 
     assert not wrong, f"get_template_for 并发读到非 80(默认值漏入): {wrong[:15]}"
     assert not errors, f"并发访问抛异常: {errors[:15]}"
+
+
+def test_concurrent_active_merge_creation_has_one_winner_per_condition(tmp_path):
+    db = Database(str(tmp_path / "merge-race.db"))
+    db.init()
+    barrier = threading.Barrier(8)
+    created: list[int] = []
+    duplicate_ids: list[int | None] = []
+    errors: list[str] = []
+    result_lock = threading.Lock()
+
+    def create():
+        try:
+            barrier.wait()
+            operation_id = db.create_merge_operation(
+                "0xWallet", "0xFunder", "condition-A", "yes", "no", 5
+            )
+            with result_lock:
+                created.append(operation_id)
+        except ActiveMergeOperationExists as exc:
+            with result_lock:
+                duplicate_ids.append(exc.operation_id)
+        except Exception as exc:  # noqa: BLE001
+            with result_lock:
+                errors.append(repr(exc))
+
+    threads = [threading.Thread(target=create) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert len(created) == 1
+    assert duplicate_ids == [created[0]] * 7
+    assert len(db.get_unresolved_merges("0xWallet", "condition-A")) == 1
+
+    # The same wallet can independently own condition B.
+    assert db.create_merge_operation(
+        "0xWallet", "0xFunder", "condition-B", "yes-b", "no-b", 3
+    )

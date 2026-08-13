@@ -24,6 +24,13 @@ def test_merge_pair_planning_exact_unequal_and_fractional():
     assert ordinary_binary_plan("0xc", _positions(20, 20, neg_risk=True), 1) is None
 
 
+def test_merge_pair_condition_id_match_is_case_insensitive():
+    plan = ordinary_binary_plan("0xC", _positions(20, 12), 1)
+
+    assert plan is not None
+    assert plan.qty == 12
+
+
 def test_reserved_sell_quantity_tracks_unfilled_reservation():
     orders = [
         {"side": "SELL", "asset_id": "yes", "original_size": "20", "size_matched": "3"},

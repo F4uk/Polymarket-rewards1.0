@@ -7,6 +7,8 @@ out of scope.
 
 from dataclasses import dataclass
 
+from engine.positions import condition_key
+
 
 EPSILON = 1e-9
 
@@ -36,7 +38,7 @@ def ordinary_binary_plan(condition_id: str, positions: list[dict], minimum: floa
         return None
     outcomes = {}
     for p in positions or []:
-        if str(p.get("conditionId", "")) != str(condition_id):
+        if condition_key(p.get("conditionId", "")) != condition_key(condition_id):
             continue
         if bool(p.get("negRisk") or p.get("neg_risk")):
             return None

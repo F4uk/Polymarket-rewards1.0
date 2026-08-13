@@ -23,11 +23,12 @@ from engine.strategy import reward_price_range
 from engine.rewards import extract_max_spread, extract_daily_rate
 from engine import monitor_status
 from engine.merge import ordinary_binary_plan
-from engine.positions import positions_by_condition
+from engine.positions import condition_key, positions_by_condition
 from engine.take_profit import consume_fifo_lots
 from api.ctf import RelayerUnavailable, Type3MergeClient
 from api.polymarket_api import OrderRejected
 from api.proxy import parallel_map
+from models.database import ActiveMergeOperationExists
 
 logger = logging.getLogger(__name__)
 
@@ -389,8 +390,41 @@ class OrderMonitor:
             payload = payload[0] if payload else {}
         return str((payload or {}).get("state", ""))
 
-    def _confirm_unresolved_merges(self, client):
-        for operation in self.db.get_unresolved_merges(self.wallet_address):
+    def _quarantine_duplicate_active_merges(self, operations):
+        """Persist a fail-closed marker for ambiguous legacy active rows."""
+        active_by_condition: dict[str, list[dict]] = {}
+        for operation in operations or []:
+            active_by_condition.setdefault(
+                condition_key(operation.get("condition_id", "")), []
+            ).append(operation)
+        duplicate_conditions = {
+            cid
+            for cid, grouped in active_by_condition.items()
+            if cid and len(grouped) != 1
+        }
+        for cid in duplicate_conditions:
+            logger.error(
+                "multiple active Merge rows for condition %s; automatic submission disabled",
+                cid,
+            )
+            # Persist quarantine *before* polling any submitted sibling.  If
+            # that sibling confirms in this tick, the remaining planned row
+            # must not suddenly look like a unique operation and dispatch.
+            for duplicate in active_by_condition[cid]:
+                if duplicate.get("status") == "planned" and not str(
+                    duplicate.get("error", "")
+                ).startswith("DUPLICATE_ACTIVE_QUARANTINE:"):
+                    self.db.update_merge_operation(
+                        duplicate["id"],
+                        "planned",
+                        error="DUPLICATE_ACTIVE_QUARANTINE: legacy active rows require manual reconciliation",
+                    )
+        return duplicate_conditions
+
+    def _confirm_unresolved_merges(self, client, operations=None):
+        if operations is None:
+            operations = self.db.get_unresolved_merges(self.wallet_address)
+        for operation in operations:
             if operation.get("status") != "submitted" or not operation.get("relayer_id"):
                 continue
             try:
@@ -400,15 +434,70 @@ class OrderMonitor:
                 logger.warning("merge status check %s failed: %s", operation["id"], exc)
                 continue
             if state == "STATE_CONFIRMED":
+                # Relayer confirmation is the funds-moving terminal boundary.
+                # Mark it before optional FIFO accounting so a bookkeeping
+                # retry can never masquerade as an in-flight transaction.
+                self.db.update_merge_operation(
+                    operation["id"],
+                    "confirmed",
+                    error="FIFO_LEDGER_PENDING: Relayer confirmed; reconciliation pending",
+                )
+                self._pending_fok_until.pop(
+                    condition_key(operation.get("condition_id", "")), None
+                )
                 self._confirm_merge_operation(operation)
             elif state in ("STATE_FAILED", "STATE_INVALID"):
                 self.db.update_merge_operation(
                     operation["id"], "failed", error=f"Relayer state {state}"
                 )
+                self._pending_fok_until.pop(
+                    condition_key(operation.get("condition_id", "")), None
+                )
                 self._record_action(
                     operation["condition_id"], "merge_failed", "-", -1, operation["requested_qty"],
                     f"Merge failed: {state}", "Relayer transaction status",
                 )
+
+    def _retry_confirmed_merge_ledgers(self):
+        """Retry accounting only; confirmed operations never re-enter funds flow."""
+        for operation in self.db.get_confirmed_pending_merges(self.wallet_address):
+            self._confirm_merge_operation(operation)
+
+    def _reconcile_confirmed_merge_inventory(self):
+        """Clear post-confirmation barriers only after consumption is visible.
+
+        A submitted Merge is terminal at Relayer confirmation, so this barrier
+        must not block residual SELLs.  It only prevents stale Data API rows
+        from being interpreted as a brand-new complete set.
+        """
+        barriers = self.db.get_merge_inventory_barriers(self.wallet_address)
+        if not barriers:
+            return
+        try:
+            positions = self.api.get_user_positions(self._funder())
+        except Exception as exc:
+            logger.warning("confirmed Merge inventory reconciliation failed: %s", exc)
+            return
+        by_asset: dict[str, float] = {}
+        for position in positions or []:
+            try:
+                by_asset[str(position.get("asset", ""))] = float(
+                    position.get("size", 0) or 0
+                )
+            except (TypeError, ValueError):
+                continue
+        for operation in barriers:
+            requested = float(operation.get("requested_qty", 0) or 0)
+            visible_pair = min(
+                by_asset.get(str(operation.get("yes_asset_id", "")), 0.0),
+                by_asset.get(str(operation.get("no_asset_id", "")), 0.0),
+            )
+            # Immediately before submission both legs were >= requested.
+            # Seeing either leg below that amount proves the Merge inventory
+            # mutation has reached the Data API (ordinary V1 always merges the
+            # entire smaller leg).
+            if visible_pair < requested - 1e-9:
+                self.db.mark_merge_inventory_reconciled(operation["id"])
 
     def _reconcile_planned_merges(self, client, condition_lock):
         """Turn durable planned operations into submissions only after inventory is visible.
@@ -420,8 +509,18 @@ class OrderMonitor:
         now = time.time()
         tmpl = self.db.get_template_for(self.wallet_address)
         minimum = float(tmpl.get("merge_min_shares", 1) or 0)
-        for operation in self.db.get_unresolved_merges(self.wallet_address):
+        unresolved = self.db.get_unresolved_merges(self.wallet_address)
+        duplicate_conditions = self._quarantine_duplicate_active_merges(unresolved)
+        for operation in unresolved:
             if operation.get("status") != "planned":
+                continue
+            if str(operation.get("error", "")).startswith(
+                "DUPLICATE_ACTIVE_QUARANTINE:"
+            ):
+                logger.error(
+                    "merge %s is quarantined after duplicate active rows; automatic submission is disabled",
+                    operation.get("id"),
+                )
                 continue
             if str(operation.get("error", "")).startswith("relayer submission indeterminate"):
                 # The server may have received the signed batch despite the
@@ -435,6 +534,11 @@ class OrderMonitor:
             cid = operation.get("condition_id", "")
             if not cid:
                 self.db.update_merge_operation(operation["id"], "failed", error="planned merge missing condition")
+                continue
+            # A legacy database can predate the partial unique index.  Locks
+            # only serialize duplicate rows; they do not make either row the
+            # rightful owner.  Fail closed instead of dispatching twice.
+            if condition_key(cid) in duplicate_conditions:
                 continue
             lock = condition_lock(cid)
             if not lock.acquire(blocking=False):
@@ -452,6 +556,7 @@ class OrderMonitor:
                         self.db.update_merge_operation(
                             operation["id"], "failed", error="confirmed complete set not visible after planned-merge grace"
                         )
+                        self._pending_fok_until.pop(condition_key(cid), None)
                         self._record_action(
                             cid, "merge_failed", "-", -1, operation.get("requested_qty", 0),
                             "planned Merge inventory did not reconcile", "no relayer submission; inventory not assumed"
@@ -491,17 +596,19 @@ class OrderMonitor:
                     response = client.submit_merge(self._funder(), cid, final.qty)
                     relayer_id, tx_hash = self._relayer_details(response)
                     if not relayer_id:
-                        raise RelayerUnavailable("Relayer did not return a transaction id")
+                        raise RuntimeError(
+                            "relayer response missing transaction id after dispatch"
+                        )
                     self.db.update_merge_operation(operation["id"], "submitted", relayer_id, tx_hash)
                     self._record_action(
                         cid, "merge_submitted", "-", 1.0, final.qty,
                         "planned Merge submitted after confirmed inventory refresh", f"relayer_id={relayer_id}"
                     )
                 except RelayerUnavailable as exc:
-                    # Nothing was sent when the relayer declined a malformed
-                    # response (for example no transaction id), so failing is
-                    # safe and lets a later normal inventory scan decide anew.
+                    # Type3MergeClient raises this only during validation/
+                    # nonce preparation, before execute_deposit_wallet_batch.
                     self.db.update_merge_operation(operation["id"], "failed", error=str(exc))
+                    self._pending_fok_until.pop(condition_key(cid), None)
                     self._record_action(
                         cid, "merge_failed", "-", -1, operation.get("requested_qty", 0),
                         f"planned Merge submission rejected: {exc}", "no inventory assumed merged"
@@ -576,13 +683,14 @@ class OrderMonitor:
                 consumed.append({"asset_id": asset, "lots": taken})
                 total_cost += cost
             except Exception as exc:
-                # The chain outcome is already confirmed. Keep this operation
-                # pending so the durable FIFO journal can be reconstructed on a
-                # later tick; never submit a second merge for it.
+                # The chain outcome is already confirmed.  Keep a terminal,
+                # ledger-pending state so residual inventory can exit; the
+                # confirmed-operation guard prevents Data API lag from causing
+                # a second Merge until the FIFO journal is reconstructed.
                 self.db.update_merge_operation(
                     operation["id"],
-                    "submitted",
-                    error=f"confirmed transaction; FIFO ledger retry required: {exc}",
+                    "confirmed",
+                    error=f"FIFO_LEDGER_PENDING: confirmed transaction; retry required: {exc}",
                 )
                 logger.error("confirmed merge %s ledger failed: %s", operation["id"], exc)
                 return
@@ -608,10 +716,34 @@ class OrderMonitor:
         except RelayerUnavailable as exc:
             logger.info("Merge unavailable for %s: %s", self.wallet_address, exc)
             return
-        self._confirm_unresolved_merges(client)
+        self._retry_confirmed_merge_ledgers()
+        initial_unresolved = self.db.get_unresolved_merges(self.wallet_address)
+        self._quarantine_duplicate_active_merges(initial_unresolved)
+        self._confirm_unresolved_merges(client, initial_unresolved)
+        self._reconcile_confirmed_merge_inventory()
         self._reconcile_planned_merges(client, condition_lock)
-        if self.db.get_unresolved_merges(self.wallet_address):
-            return
+        # Reconciliation is wallet-wide, but blocking is condition-scoped: a
+        # pending/indeterminate Merge for A must never stall new complete sets
+        # in B or C.  The per-condition lock and SQLite active-operation guard
+        # independently prevent a second A operation.
+        active_conditions = {
+            condition_key(operation.get("condition_id", ""))
+            for operation in self.db.get_unresolved_merges(self.wallet_address)
+            if operation.get("condition_id")
+        }
+        # A confirmed transaction can precede Data API inventory convergence.
+        # While its accounting journal is still pending, never infer another
+        # complete set for that same condition from stale position rows.
+        active_conditions.update(
+            condition_key(operation.get("condition_id", ""))
+            for operation in self.db.get_confirmed_pending_merges(self.wallet_address)
+            if operation.get("condition_id")
+        )
+        active_conditions.update(
+            condition_key(operation.get("condition_id", ""))
+            for operation in self.db.get_merge_inventory_barriers(self.wallet_address)
+            if operation.get("condition_id")
+        )
         try:
             positions = self.api.get_user_positions(self._funder())
             open_orders = self.api.get_open_orders()
@@ -620,6 +752,8 @@ class OrderMonitor:
             return
         minimum = float(tmpl.get("merge_min_shares", 1) or 0)
         for cid, group in positions_by_condition(positions).items():
+            if condition_key(cid) in active_conditions:
+                continue
             plan = ordinary_binary_plan(cid, group, minimum)
             if not plan:
                 continue
@@ -658,16 +792,25 @@ class OrderMonitor:
                 final = ordinary_binary_plan(cid, refreshed, minimum)
                 if not final:
                     continue
-                op_id = self.db.create_merge_operation(
-                    self.wallet_address, self._funder(), cid, final.yes_asset_id, final.no_asset_id, final.qty
-                )
+                try:
+                    op_id = self.db.create_merge_operation(
+                        self.wallet_address, self._funder(), cid,
+                        final.yes_asset_id, final.no_asset_id, final.qty,
+                    )
+                except ActiveMergeOperationExists as exc:
+                    logger.info("merge already active for %s: %s", cid, exc)
+                    active_conditions.add(condition_key(cid))
+                    continue
+                active_conditions.add(condition_key(cid))
                 self._record_action(cid, "merge_planned", "-", 1.0, final.qty,
                                     "ordinary binary complete set planned", "confirmed positions after SELL cancellation")
                 try:
                     response = client.submit_merge(self._funder(), cid, final.qty)
                     relayer_id, tx_hash = self._relayer_details(response)
                     if not relayer_id:
-                        raise RelayerUnavailable("Relayer did not return a transaction id")
+                        raise RuntimeError(
+                            "relayer response missing transaction id after dispatch"
+                        )
                     self.db.update_merge_operation(op_id, "submitted", relayer_id, tx_hash)
                     self._record_action(cid, "merge_submitted", "-", 1.0, final.qty,
                                         "Merge submitted; awaiting confirmation", f"relayer_id={relayer_id}")
@@ -921,6 +1064,13 @@ class OrderMonitor:
                 op_id = self.db.create_merge_operation(
                     self.wallet_address, self._funder(), cid, asset_id, complement, size
                 )
+            except ActiveMergeOperationExists as exc:
+                # Another worker/process already owns this exact condition.
+                # It may also own an accepted/indeterminate FOK, so falling
+                # through to a direct SELL would race the same inventory.
+                self._release_condition_lock(mutation_lock)
+                logger.info("urgent Merge already active for %s: %s", cid, exc)
+                return "wait_for_merge"
             except Exception as exc:
                 self._release_condition_lock(mutation_lock)
                 logger.error("cannot persist pre-FOK Merge plan %s: %s", cid, exc)
@@ -933,6 +1083,7 @@ class OrderMonitor:
                     )
                 except OrderRejected as exc:
                     self.db.update_merge_operation(op_id, "failed", error=f"FOK unfilled/rejected: {exc}")
+                    self._pending_fok_until.pop(condition_key(cid), None)
                     self._record_action(cid, "urgent_fok_failed", "-", -1, size,
                                         f"FOK failed: {exc}", "no FOK inventory assumed; fall back to direct exit")
                     return None
@@ -944,7 +1095,9 @@ class OrderMonitor:
                     self.db.update_merge_operation(
                         op_id, "planned", error=f"FOK submission indeterminate; awaiting inventory: {exc}"
                     )
-                    self._pending_fok_until[cid] = time.time() + _FOK_RECONCILE_GRACE_SEC
+                    self._pending_fok_until[condition_key(cid)] = (
+                        time.time() + _FOK_RECONCILE_GRACE_SEC
+                    )
                     self._record_action(cid, "urgent_fok_indeterminate", "-", -1, size,
                                         "FOK transport outcome unknown; awaiting inventory", str(exc))
                     return "wait_for_merge"
@@ -956,7 +1109,9 @@ class OrderMonitor:
             self.db.update_merge_operation(
                 op_id, "planned", error="FOK accepted; awaiting confirmed Data API inventory"
             )
-            self._pending_fok_until[cid] = time.time() + _FOK_RECONCILE_GRACE_SEC
+            self._pending_fok_until[condition_key(cid)] = (
+                time.time() + _FOK_RECONCILE_GRACE_SEC
+            )
             self._record_action(cid, "urgent_fok_submitted", "BUY", -1, size,
                                 "FOK complement accepted; awaiting inventory then Merge", "all-or-nothing protected buy")
             return "wait_for_merge"
@@ -1000,6 +1155,16 @@ class OrderMonitor:
         # Complete binary sets are collateral-equivalent.  Low-balance recovery
         # must never unilateral-sell either leg before the merge pass can act.
         merge_reserved = self.paired_reservations(positions)
+        in_flight_merge_conditions = {
+            condition_key(operation.get("condition_id", ""))
+            for operation in self.db.get_unresolved_merges(self.wallet_address)
+            if operation.get("condition_id")
+        }
+        in_flight_merge_conditions.update(
+            condition_key(cid)
+            for cid, until in self._pending_fok_until.items()
+            if until > time.time()
+        )
         # 逐仓的成交/盘口一次性并发取好,下面的循环只做纯判定(见 _exit_prefetch)。
         # 包 try:parallel_map 可能在任何一个任务开跑之前就抛(最现实的是线程池建不出线程,
         # N 个钱包 × 6 路 + 采集的 4 路同进程),让它逃出去会连带跳过后面的 check_exit ——
@@ -1017,12 +1182,14 @@ class OrderMonitor:
             size = float(pos.get("size", 0) or 0)
             if size <= 0:
                 continue
+            cid = pos.get("conditionId", "")
+            if condition_key(cid) in in_flight_merge_conditions:
+                continue
             # Keep all inventory in a pair-bearing condition untouched until
             # the merge has settled. Selling only the apparent residual could
             # consume the paired quantity before relayer confirmation.
             if merge_reserved.get(asset_id, 0) > 0:
                 continue
-            cid = pos.get("conditionId", "")
             cur = float(pos.get("curPrice", 0) or 0)
             cost, lots = self._cost_lots(asset_id, size, cid)
             if cost is None:
@@ -1129,17 +1296,18 @@ class OrderMonitor:
         ]
         status_map = self.api.gamma_resolution_status(cids)
         resolving = {c for c in cids if in_resolution(status_map.get(c))}
-        # Resolution liquidation retains its existing precedence over Merge:
-        # when a real UMA status arrives, waiting for a relayer confirmation
-        # could strand a losing complete set at settlement. Gamma failure is
-        # still fail-open (``resolving`` stays empty).
+        # A funds-moving Merge always precedes resolution liquidation.  UMA
+        # status cannot make it safe to sell inventory that a submitted Merge
+        # (or an accepted/indeterminate FOK plan) may already be consuming.
         unresolved_conditions = {
-            op.get("condition_id", "") for op in self.db.get_unresolved_merges(self.wallet_address)
-        } - resolving
+            condition_key(op.get("condition_id", ""))
+            for op in self.db.get_unresolved_merges(self.wallet_address)
+            if op.get("condition_id")
+        }
         unresolved_conditions.update(
-            cid
+            condition_key(cid)
             for cid, until in self._pending_fok_until.items()
-            if until > time.time() and cid not in resolving
+            if until > time.time()
         )
         self.last_position_count = len(cids)
         # 本轮真要判定的仓(刚被低余额清掉的不算)一次性并发取好成交与盘口。
@@ -1162,14 +1330,14 @@ class OrderMonitor:
                 # 别对已无份额的仓挂卖单被拒、报假「裸奔」;下 tick 持仓刷新后自然消失。
             try:
                 cid = pos.get("conditionId", "")
-                if cid in unresolved_conditions:
+                if condition_key(cid) in unresolved_conditions:
                     self._status_add(
                         market=cid, side="卖出", price="-", size=str(pos.get("size", "")),
                         matched="-", stage="合并", action="等待合并确认",
                         detail="未决 Relayer Merge 阻止并行离场变更",
                     )
                     continue
-                reserved_qty = 0.0 if cid in resolving else merge_reserved.get(pos.get("asset", ""), 0.0)
+                reserved_qty = merge_reserved.get(pos.get("asset", ""), 0.0)
                 size = float(pos.get("size", 0) or 0)
                 if reserved_qty >= size - 1e-9:
                     self._status_add(

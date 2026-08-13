@@ -2,6 +2,7 @@
 
 把这个程序部署到一台 Linux VPS，通过域名 + HTTPS 远程使用。
 部署与后续维护均由管理员显式执行；运行中应用不会自行更新。
+历史设计背景见 [`docs/superpowers/specs/2026-07-27-vps-deployment-design.md`](../docs/superpowers/specs/2026-07-27-vps-deployment-design.md)（其中网页自更新章节已停用）。
 
 ## 前提
 

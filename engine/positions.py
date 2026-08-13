@@ -2,6 +2,16 @@
 """Pure helpers derived from Polymarket Data API /positions (no network/IO)."""
 
 
+def condition_key(condition_id) -> str:
+    """Canonical comparison/lock key for a condition id.
+
+    SQLite active-Merge uniqueness is NOCASE, so every in-memory safety gate
+    must use the same equivalence relation while preserving the original id
+    for API calls and audit records.
+    """
+    return str(condition_id or "").strip().lower()
+
+
 def held_side_info(positions: list[dict]):
     """从 Data API /positions 提取按侧(asset)暂停信息 + 按市场已持仓敞口。
 

@@ -155,6 +155,8 @@ pytest tests/test_strategy.py     # 单个文件
 > Auth gates everything (engines can't auto-start). One shared scanner thread feeds per-wallet workers; SQLite is shared across threads. The pipeline is scan → strategy → place → monitor. The gap-tier placement logic in `engine/laddering.py` (plus `engine/strategy.py` and the tier matching in `engine/tiers.py`) is pure, fully unit-tested, and the core IP.
 
 更详细的设计文档（简体中文）见 `docs/superpowers/specs/2026-05-17-polymarket-market-maker-design.md`。
+
+开发约定与关键不变量见 [CLAUDE.md](CLAUDE.md)。
 开发时请以本 README、测试和代码中的安全不变量为准。
 
 ---

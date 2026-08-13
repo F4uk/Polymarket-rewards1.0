@@ -174,7 +174,9 @@ def pick_funded_sig_type(by_sig: dict) -> int | None:
 class PolymarketAPI:
     """Wrapper for one wallet's Polymarket connection.
 
-    Orders are placed from the GNOSIS_SAFE browser-wallet proxy (signature_type=2).
+    CLOB credentials authenticate the controlling EOA.  Orders execute from
+    the configured funder using the selected wallet signature type (including
+    POLY_1271 Deposit Wallets for type 3).
     """
 
     def __init__(
@@ -204,6 +206,10 @@ class PolymarketAPI:
         # 构造期的网络调用(create_or_derive_api_key)也必须走该钱包代理。
         with use_proxy(self.proxy_url):
             # Step 1: Create temp client to derive API creds + the signer EOA.
+            # This identity split is intentional for Type3 too: current CLOB
+            # L1/L2 headers identify the controlling EOA, while the order
+            # builder below identifies the Deposit Wallet as maker/signer and
+            # wraps the EOA signature in the POLY_1271 form.
             temp_client = ClobClient(
                 host=POLYMARKET_HOST,
                 key=private_key,
@@ -218,7 +224,9 @@ class PolymarketAPI:
             # deterministically derived from the EOA — NOT the EOA itself. Derive
             # it when no funder is supplied.
             eoa_address = temp_client.get_address()
-            # Step 2: Create full client with L2 auth
+            # Step 2: Create the wallet-aware order client with those EOA-bound
+            # L2 credentials.  Do not derive a second credential identity from
+            # the funder: the official Type3 path uses this exact combination.
             resolved_funder = funder or derive_deposit_address(eoa_address)
             self.client = ClobClient(
                 host=POLYMARKET_HOST,

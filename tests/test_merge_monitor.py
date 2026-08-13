@@ -9,12 +9,20 @@ from api.polymarket_api import OrderRejected
 
 
 CID = "0x" + "c" * 64
+CID_B = "0x" + "b" * 64
 
 
 def _positions(yes=20.0, no=12.0):
     return [
         {"conditionId": CID, "asset": "yes", "outcome": "Yes", "size": yes},
         {"conditionId": CID, "asset": "no", "outcome": "No", "size": no},
+    ]
+
+
+def _positions_for(cid, yes_asset, no_asset, yes=20.0, no=12.0):
+    return [
+        {"conditionId": cid, "asset": yes_asset, "outcome": "Yes", "size": yes},
+        {"conditionId": cid, "asset": no_asset, "outcome": "No", "size": no},
     ]
 
 
@@ -34,6 +42,8 @@ def _monitor():
     ]
     db.get_template_for.return_value = {"merge_enabled": True, "merge_min_shares": 1}
     db.get_unresolved_merges.return_value = []
+    db.get_confirmed_pending_merges.return_value = []
+    db.get_merge_inventory_barriers.return_value = []
     db.create_merge_operation.return_value = 17
     return OrderMonitor(api, db, "0xWallet"), api, db
 
@@ -75,9 +85,9 @@ def test_merge_waits_when_sell_cancellation_has_not_reconciled():
 def test_unresolved_submitted_merge_is_reconciled_without_duplicate_submission():
     monitor, api, db = _monitor()
     db.get_unresolved_merges.side_effect = [
-        [{"id": 17, "status": "submitted", "relayer_id": "relayer-1"}],
-        [{"id": 17, "status": "submitted", "relayer_id": "relayer-1"}],
-        [{"id": 17, "status": "submitted", "relayer_id": "relayer-1"}],
+        [{"id": 17, "condition_id": CID, "status": "submitted", "relayer_id": "relayer-1"}],
+        [{"id": 17, "condition_id": CID, "status": "submitted", "relayer_id": "relayer-1"}],
+        [{"id": 17, "condition_id": CID, "status": "submitted", "relayer_id": "relayer-1"}],
     ]
     client = MagicMock()
     client.get_transaction.return_value = {"state": "STATE_PENDING"}
@@ -87,7 +97,77 @@ def test_unresolved_submitted_merge_is_reconciled_without_duplicate_submission()
 
     client.get_transaction.assert_called_once_with("relayer-1")
     client.submit_merge.assert_not_called()
-    api.get_user_positions.assert_not_called()
+    # Other conditions must still be scanned; this test's only inventory is A,
+    # so no new operation can be submitted for it.
+    api.get_user_positions.assert_called_once_with("0xFunder")
+
+
+def test_pending_a_blocks_only_a_and_b_still_submits_merge():
+    monitor, api, db = _monitor()
+    pending_a = {
+        "id": 17,
+        "condition_id": CID,
+        "status": "submitted",
+        "relayer_id": "relayer-a",
+        "requested_qty": 12,
+    }
+    db.get_unresolved_merges.side_effect = [
+        [pending_a],  # relayer reconciliation
+        [pending_a],  # planned reconciliation
+        [pending_a],  # condition-scoped block snapshot
+    ]
+    api.get_user_positions.side_effect = [
+        _positions_for(CID, "a-yes", "a-no")
+        + _positions_for(CID_B, "b-yes", "b-no", yes=9, no=7),
+        _positions_for(CID_B, "b-yes", "b-no", yes=9, no=7),
+    ]
+    api.get_open_orders.return_value = []
+    db.create_merge_operation.return_value = 29
+    client = MagicMock()
+    client.get_transaction.return_value = {"state": "STATE_PENDING"}
+    client.submit_merge.return_value.transaction_id = "relayer-b"
+
+    with patch.object(monitor, "_merge_client", return_value=client):
+        monitor.check_merges(lambda _cid: threading.Lock())
+
+    client.get_transaction.assert_called_once_with("relayer-a")
+    db.create_merge_operation.assert_called_once_with(
+        "0xWallet", "0xFunder", CID_B, "b-yes", "b-no", 7.0
+    )
+    client.submit_merge.assert_called_once_with("0xFunder", CID_B, 7.0)
+
+
+def test_indeterminate_a_blocks_only_a_and_b_still_submits_merge():
+    monitor, api, db = _monitor()
+    indeterminate_a = {
+        "id": 17,
+        "condition_id": CID,
+        "status": "planned",
+        "requested_qty": 12,
+        "error": "relayer submission indeterminate: timeout",
+    }
+    db.get_unresolved_merges.side_effect = [
+        [indeterminate_a],
+        [indeterminate_a],
+        [indeterminate_a],
+    ]
+    api.get_user_positions.side_effect = [
+        _positions_for(CID, "a-yes", "a-no")
+        + _positions_for(CID_B, "b-yes", "b-no", yes=9, no=7),
+        _positions_for(CID_B, "b-yes", "b-no", yes=9, no=7),
+    ]
+    api.get_open_orders.return_value = []
+    db.create_merge_operation.return_value = 29
+    client = MagicMock()
+    client.submit_merge.return_value.transaction_id = "relayer-b"
+
+    with patch.object(monitor, "_merge_client", return_value=client):
+        monitor.check_merges(lambda _cid: threading.Lock())
+
+    db.create_merge_operation.assert_called_once_with(
+        "0xWallet", "0xFunder", CID_B, "b-yes", "b-no", 7.0
+    )
+    client.submit_merge.assert_called_once_with("0xFunder", CID_B, 7.0)
 
 
 def test_failed_relayer_state_keeps_inventory_and_never_marks_confirmed():
@@ -101,7 +181,9 @@ def test_failed_relayer_state_keeps_inventory_and_never_marks_confirmed():
         monitor.check_merges(lambda _cid: threading.Lock())
 
     assert db.update_merge_operation.call_args.args[:2] == (17, "failed")
-    api.get_user_positions.assert_not_called()
+    # A terminal failure releases the condition immediately, so the ordinary
+    # inventory pass may safely consider it again in the same tick.
+    api.get_user_positions.assert_called_once_with("0xFunder")
     assert all(call.args[1] != "confirmed" for call in db.update_merge_operation.call_args_list)
 
 
@@ -152,6 +234,122 @@ def test_indeterminate_relayer_submission_is_retained_without_duplicate_retry():
     assert db.update_merge_operation.call_args.args[:2] == (17, "planned")
     assert "indeterminate" in db.update_merge_operation.call_args.kwargs["error"]
     client.submit_merge.assert_called_once()
+
+
+def test_post_dispatch_response_without_id_stays_indeterminate_and_active():
+    monitor, _api, db = _monitor()
+    db.get_unresolved_merges.side_effect = [[], [], []]
+    db.get_confirmed_pending_merges.return_value = []
+    client = MagicMock()
+    client.submit_merge.return_value.transaction_id = ""
+    client.submit_merge.return_value.transaction_hash = ""
+
+    with patch.object(monitor, "_merge_client", return_value=client):
+        monitor.check_merges(lambda _cid: threading.Lock())
+
+    assert db.update_merge_operation.call_args.args[:2] == (17, "planned")
+    assert "indeterminate" in db.update_merge_operation.call_args.kwargs["error"]
+
+
+def test_legacy_duplicate_active_rows_are_never_auto_submitted():
+    monitor, _api, db = _monitor()
+    duplicates = [
+        {"id": 17, "status": "submitted", "condition_id": CID, "relayer_id": "r"},
+        {"id": 18, "status": "planned", "condition_id": CID.lower(), "created_at": 1},
+    ]
+    db.get_unresolved_merges.side_effect = [duplicates, duplicates, duplicates]
+    db.get_confirmed_pending_merges.return_value = []
+    client = MagicMock()
+    client.get_transaction.return_value = {"state": "STATE_PENDING"}
+
+    with patch.object(monitor, "_merge_client", return_value=client):
+        monitor.check_merges(lambda _cid: threading.Lock())
+
+    client.submit_merge.assert_not_called()
+    assert any(
+        call.args[:2] == (18, "planned")
+        and str(call.kwargs.get("error", "")).startswith(
+            "DUPLICATE_ACTIVE_QUARANTINE:"
+        )
+        for call in db.update_merge_operation.call_args_list
+    )
+
+
+def test_quarantined_duplicate_stays_blocked_after_sibling_confirms():
+    monitor, _api, db = _monitor()
+    submitted = {
+        "id": 17,
+        "status": "submitted",
+        "condition_id": CID,
+        "relayer_id": "r",
+        "requested_qty": 12,
+        "yes_asset_id": "yes",
+        "no_asset_id": "no",
+    }
+    planned = {
+        "id": 18,
+        "status": "planned",
+        "condition_id": CID.lower(),
+        "created_at": 1,
+        "error": "",
+    }
+    quarantined = {
+        **planned,
+        "error": "DUPLICATE_ACTIVE_QUARANTINE: manual reconciliation required",
+    }
+    db.get_unresolved_merges.side_effect = [
+        [submitted, planned],
+        [quarantined],
+        [quarantined],
+    ]
+    db.get_confirmed_pending_merges.return_value = []
+    db.get_merge_inventory_barriers.return_value = [
+        {**submitted, "status": "confirmed"}
+    ]
+    client = MagicMock()
+    client.get_transaction.return_value = {"state": "STATE_CONFIRMED"}
+
+    with (
+        patch.object(monitor, "_merge_client", return_value=client),
+        patch.object(monitor, "_confirm_merge_operation"),
+    ):
+        monitor.check_merges(lambda _cid: threading.Lock())
+
+    client.submit_merge.assert_not_called()
+    assert any(
+        call.args[:2] == (18, "planned")
+        and str(call.kwargs.get("error", "")).startswith(
+            "DUPLICATE_ACTIVE_QUARANTINE:"
+        )
+        for call in db.update_merge_operation.call_args_list
+    )
+
+
+def test_confirmed_merge_ledger_failure_is_terminal_but_blocks_second_merge():
+    monitor, api, db = _monitor()
+    operation = {
+        "id": 17,
+        "status": "submitted",
+        "condition_id": CID,
+        "relayer_id": "r",
+        "requested_qty": 12,
+        "yes_asset_id": "yes",
+        "no_asset_id": "no",
+    }
+    db.get_unresolved_merges.side_effect = [[operation], [], []]
+    pending = {**operation, "status": "confirmed"}
+    db.get_confirmed_pending_merges.return_value = []
+    db.get_merge_inventory_barriers.return_value = [pending]
+    api.get_trades.side_effect = RuntimeError("history unavailable")
+    client = MagicMock()
+    client.get_transaction.return_value = {"state": "STATE_CONFIRMED"}
+
+    with patch.object(monitor, "_merge_client", return_value=client):
+        monitor.check_merges(lambda _cid: threading.Lock())
+
+    states = [call.args[1] for call in db.update_merge_operation.call_args_list]
+    assert states == ["confirmed", "confirmed"]
+    client.submit_merge.assert_not_called()
 
 
 def test_restart_fifo_replay_uses_prior_confirmed_merge_journal():

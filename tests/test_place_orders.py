@@ -172,6 +172,22 @@ def test_concurrent_market_cap_counts_open_sell_held_and_pending_merge():
     api.place_limit_buy.assert_not_called()
 
 
+def test_pending_merge_a_does_not_block_order_maintenance_for_c():
+    worker, api, db = _make_worker()
+    db.get_unresolved_merges.return_value = [
+        {"condition_id": "A", "status": "submitted"}
+    ]
+    api.get_orderbook.return_value = _ob([(0.30, 300)], [(0.31, 1000)])
+
+    worker.place_orders(
+        [_elig("A", "A-y", "Yes"), _elig("C", "C-y", "Yes")]
+    )
+
+    placed_tokens = [call.args[0] for call in api.place_limit_buy.call_args_list]
+    assert "A-y" not in placed_tokens
+    assert "C-y" in placed_tokens
+
+
 def test_configured_and_reward_price_ranges_must_intersect():
     worker, api, _ = _make_worker(template={"min_price_cents": 60, "max_price_cents": 70})
     api.get_orderbook.return_value = _ob([(0.30, 300)], [(0.31, 1000)])

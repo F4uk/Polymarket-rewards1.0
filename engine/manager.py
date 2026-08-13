@@ -15,7 +15,7 @@ from api.proxy import use_proxy
 from config import CATEGORY_CATALOG
 from engine.scanner import MarketScanner, ScanSuperseded
 from engine.monitor import OrderMonitor
-from engine.positions import held_side_info
+from engine.positions import condition_key, held_side_info
 from engine.resolution import in_resolution
 from engine.tiers import tier_for
 from engine.pnl import beijing_day
@@ -186,8 +186,9 @@ class WalletWorker:
 
     def _condition_lock(self, condition_id: str) -> threading.Lock:
         """Return this wallet's narrow lock for one merge condition."""
+        key = condition_key(condition_id)
         with self._condition_locks_guard:
-            return self._condition_locks.setdefault(condition_id, threading.Lock())
+            return self._condition_locks.setdefault(key, threading.Lock())
 
     def _maybe_rebuild_pnl(self):
         """每日盈亏台账:首个 tick(含每次重启)从 2026-05-17 全量补漏到今天;之后跨北京日
@@ -274,7 +275,7 @@ class WalletWorker:
 
         buy_orders = [o for o in open_orders if o.get("side") == "BUY"]
         pending_merge_conditions = {
-            operation.get("condition_id", "")
+            condition_key(operation.get("condition_id", ""))
             for operation in self.db.get_unresolved_merges(self.wallet_address)
         }
         buys_by_token, markets_with_open = {}, set()
@@ -356,7 +357,7 @@ class WalletWorker:
                 continue
             if mid in resolving:
                 continue
-            if mid in pending_merge_conditions:
+            if condition_key(mid) in pending_merge_conditions:
                 continue
             # A merge owns this condition while it cancels SELL reservations,
             # refreshes positions and submits the relayer transaction. Do not

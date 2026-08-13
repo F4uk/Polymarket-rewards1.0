@@ -1,5 +1,21 @@
 __pycache__/
 *.pyc
+.venv/
+venv/
+
+# Local secrets and credentials.  Keep only explicit example files in Git.
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.keystore
+id_rsa*
+id_ed25519*
+
 market_maker.db
 market_maker.db-wal
 market_maker.db-shm

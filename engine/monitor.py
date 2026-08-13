@@ -999,12 +999,6 @@ class OrderMonitor:
             return
         # Complete binary sets are collateral-equivalent.  Low-balance recovery
         # must never unilateral-sell either leg before the merge pass can act.
-        unresolved_conditions = {
-            op.get("condition_id", "") for op in self.db.get_unresolved_merges(self.wallet_address)
-        }
-        unresolved_conditions.update(
-            cid for cid, until in self._pending_fok_until.items() if until > time.time()
-        )
         merge_reserved = self.paired_reservations(positions)
         # 逐仓的成交/盘口一次性并发取好,下面的循环只做纯判定(见 _exit_prefetch)。
         # 包 try:parallel_map 可能在任何一个任务开跑之前就抛(最现实的是线程池建不出线程,
@@ -1029,8 +1023,6 @@ class OrderMonitor:
             if merge_reserved.get(asset_id, 0) > 0:
                 continue
             cid = pos.get("conditionId", "")
-            if cid in unresolved_conditions:
-                continue
             cur = float(pos.get("curPrice", 0) or 0)
             cost, lots = self._cost_lots(asset_id, size, cid)
             if cost is None:
@@ -1127,12 +1119,6 @@ class OrderMonitor:
         # Merge is run earlier in the tick.  Until a confirmed result changes
         # inventory, paired quantities are deliberately held out of unilateral
         # stop loss / maker-exit mutation.
-        unresolved_conditions = {
-            op.get("condition_id", "") for op in self.db.get_unresolved_merges(self.wallet_address)
-        }
-        unresolved_conditions.update(
-            cid for cid, until in self._pending_fok_until.items() if until > time.time()
-        )
         merge_reserved = self.paired_reservations(positions)
         # 结算守卫(持仓侧):对持仓所在市场批量取 UMA 结算状态,结果已提交(非空)的市场,
         # 该持仓无视盈亏市价清仓。fail-open:Gamma 返回 {} -> resolving 空 -> 全部走原离场。
@@ -1143,6 +1129,18 @@ class OrderMonitor:
         ]
         status_map = self.api.gamma_resolution_status(cids)
         resolving = {c for c in cids if in_resolution(status_map.get(c))}
+        # Resolution liquidation retains its existing precedence over Merge:
+        # when a real UMA status arrives, waiting for a relayer confirmation
+        # could strand a losing complete set at settlement. Gamma failure is
+        # still fail-open (``resolving`` stays empty).
+        unresolved_conditions = {
+            op.get("condition_id", "") for op in self.db.get_unresolved_merges(self.wallet_address)
+        } - resolving
+        unresolved_conditions.update(
+            cid
+            for cid, until in self._pending_fok_until.items()
+            if until > time.time() and cid not in resolving
+        )
         self.last_position_count = len(cids)
         # 本轮真要判定的仓(刚被低余额清掉的不算)一次性并发取好成交与盘口。
         # 包 try 的理由同 check_low_balance:预取抛出去会让整轮离场判定不执行(持仓全裸奔
@@ -1171,7 +1169,7 @@ class OrderMonitor:
                         detail="未决 Relayer Merge 阻止并行离场变更",
                     )
                     continue
-                reserved_qty = merge_reserved.get(pos.get("asset", ""), 0.0)
+                reserved_qty = 0.0 if cid in resolving else merge_reserved.get(pos.get("asset", ""), 0.0)
                 size = float(pos.get("size", 0) or 0)
                 if reserved_qty >= size - 1e-9:
                     self._status_add(

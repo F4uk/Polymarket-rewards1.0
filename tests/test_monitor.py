@@ -1683,6 +1683,21 @@ class TestResolutionExit:
         assert "exit_market" in ats
         db.record_trade.assert_called_once()  # 成本已知 -> 记 pnl
 
+    def test_resolution_overrides_pending_merge_and_complete_set_reservation(self):
+        monitor, api, db = self._setup(
+            0.30, 100, [(0.31, 500)], [(0.33, 500)], gamma={"A": "proposed"}
+        )
+        api.get_user_positions.return_value = [
+            {"asset": "A-y", "outcome": "Yes", "size": 100, "curPrice": 0.31, "conditionId": "A"},
+            {"asset": "A-n", "outcome": "No", "size": 100, "curPrice": 0.31, "conditionId": "A"},
+        ]
+        db.get_unresolved_merges.return_value = [{"condition_id": "A", "status": "submitted"}]
+        monitor._cost_lots = lambda _a, s, _c: (0.30, [{"price": 0.30, "take": s, "ts": 0, "trade_id": "t"}])
+
+        monitor.check_exit()
+
+        assert api.place_market_sell.call_count == 2
+
     def test_resolving_market_sell_passes_real_tick_size(self):
         # 0.1¢ 市场的结算清仓同样要传真实 tick,否则市价卖被客户端拦下 -> 仓等着被结算成 0。
         monitor, api, db = self._setup(

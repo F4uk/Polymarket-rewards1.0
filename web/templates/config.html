@@ -37,6 +37,54 @@
     </table>
 </section>
 
+<section class="config-section" id="relayer-config-section">
+    <h2>Merge / Relayer 授权</h2>
+    <p class="hint" style="color:#888;font-size:12px">
+        Builder API Key / Secret / Passphrase 是应用级授权，首次在
+        polymarket.com/settings 的 Builder 页面创建后在这里<b>配置一次</b>，
+        之后登录即自动解密使用，无需再手工编辑服务器环境变量。
+        普通用户无需填写 Relayer URL（默认官方 Relayer）。
+    </p>
+    <div class="form-grid">
+        <div class="form-group">
+            <label>Relayer</label>
+            <div id="relayer-url-display" style="padding-top:6px">官方 Polymarket Relayer</div>
+        </div>
+        <div class="form-group">
+            <label>状态</label>
+            <div id="relayer-status" style="padding-top:6px">未配置</div>
+        </div>
+        <div class="form-group">
+            <label>凭据来源</label>
+            <div id="relayer-source" style="padding-top:6px">未配置</div>
+        </div>
+    </div>
+    <div class="form-grid">
+        <div class="form-group">
+            <label>Builder API Key <span id="relayer-key-saved" class="hint" style="color:#080;font-size:12px"></span></label>
+            <input type="password" id="relayer-api-key" autocomplete="new-password" placeholder="polymarket.com/settings Builder 页面创建">
+        </div>
+        <div class="form-group">
+            <label>Builder Secret <span id="relayer-secret-saved" class="hint" style="color:#080;font-size:12px"></span></label>
+            <input type="password" id="relayer-secret" autocomplete="new-password" placeholder="…">
+        </div>
+        <div class="form-group">
+            <label>Builder Passphrase <span id="relayer-passphrase-saved" class="hint" style="color:#080;font-size:12px"></span></label>
+            <input type="password" id="relayer-passphrase" autocomplete="new-password" placeholder="…">
+        </div>
+    </div>
+    <div class="form-inline">
+        <button class="btn btn-primary" onclick="saveRelayerConfig()">保存并测试</button>
+        <button class="btn" onclick="retestRelayerConfig()">重新测试</button>
+        <button class="btn btn-danger" onclick="deleteRelayerConfig()">删除本地凭据</button>
+    </div>
+    <div id="relayer-test-results" style="margin-top:10px"></div>
+    <p class="hint" style="color:#888;font-size:12px;margin-top:8px">
+        「保存并测试」只做<b>只读验证</b>（本地派生 Deposit Wallet、比对存款地址、Relayer 认证读 nonce），
+        不会部署钱包、不会提交 Merge、不会下单。凭据以登录密码派生的密钥 AES 加密后存库，绝不落明文。
+    </p>
+</section>
+
 <section class="config-section">
     <h2>模板管理</h2>
     <div class="form-inline">
@@ -695,7 +743,7 @@ function loadWallets() {
             <tr>
                 <td title="${w.address}">${w.address.slice(0,6)}...${w.address.slice(-4)}</td>
                 <td>${w.balance != null ? '$' + w.balance.toFixed(2) : '-'}</td>
-                <td title="${escapeHtml(w.trading_block_reason || '')}">${ACCT_TYPES[w.signature_type] || ('sig=' + w.signature_type)}<br><small>${w.signature_type === 3 ? (w.merge_available ? 'Merge 可用' : 'Merge 不可用') : '做市可用 · 自动 Merge 仅 Type3'}</small></td>
+                <td title="${escapeHtml(w.trading_block_reason || '')}">${ACCT_TYPES[w.signature_type] || ('sig=' + w.signature_type)}<br><small>${mergeStatusLabel(w)}</small>${w.deposit_wallet_deployed === false ? '<br><small style="color:#c60">Deposit Wallet 尚未部署，需要单独初始化</small>' : ''}</td>
                 <td title="${w.funder || ''}">${w.funder ? w.funder.slice(0,6)+'...'+w.funder.slice(-4) : '-'}</td>
                 <td title="${w.proxy || ''}">${proxyLabel(w.proxy)}</td>
                 <td title="${escapeHtml(w.address)}">${escapeHtml(w.remark || '')}</td>
@@ -726,6 +774,139 @@ function bindWalletTemplate(address, templateId) {
 
 const ACCT_TYPES = {0: 'EOA（直接用钱包地址）', 1: 'Proxy（邮箱/嵌入式登录）', 2: 'Safe（浏览器钱包登录）', 3: '智能合约钱包（POLY_1271）'};
 let _pendingKey = null;
+
+// --- Merge / Relayer 授权 ---
+
+function mergeStatusLabel(w) {
+    if (w.signature_type !== 3) return '做市可用 · 自动 Merge 仅 Type3';
+    if (w.merge_status === 'template_disabled') {
+        return 'Merge 已关闭（模板）' + (w.merge_capable ? ' · 凭据就绪' : '');
+    }
+    if (w.merge_status === 'ready') return 'Merge 可用';
+    return 'Merge 不可用 · ' + (w.merge_reason_cn || w.merge_reason || '未知原因');
+}
+
+const RELAYER_STATUS_META = {
+    not_configured: ['未配置', '#c60'],
+    configured_untested: ['已配置，未验证', '#b80'],
+    tested_ok: ['验证成功', '#080'],
+    tested_fail: ['验证失败', '#c00'],
+};
+
+function relayerConfigStatusText(meta) {
+    if (!meta.configured) return RELAYER_STATUS_META.not_configured;
+    if (meta.last_test_ok === true) return RELAYER_STATUS_META.tested_ok;
+    if (meta.last_test_ok === false) return RELAYER_STATUS_META.tested_fail;
+    return RELAYER_STATUS_META.configured_untested;
+}
+
+function loadRelayerConfig() {
+    fetch('/api/relayer-config').then(r => r.json()).then(meta => {
+        const [text, color] = relayerConfigStatusText(meta);
+        const statusEl = document.getElementById('relayer-status');
+        statusEl.textContent = text;
+        statusEl.style.color = color;
+        const sourceMap = {
+            encrypted_db: '本地加密配置',
+            env: '环境变量',
+            unavailable: '未配置',
+        };
+        document.getElementById('relayer-source').textContent =
+            sourceMap[meta.source] || meta.source || '未配置';
+        const urlEl = document.getElementById('relayer-url-display');
+        urlEl.textContent = meta.relayer_url_source === 'env'
+            ? (meta.relayer_url + '（环境变量覆盖）')
+            : '官方 Polymarket Relayer（' + meta.relayer_url + '）';
+        const hasDb = meta.source === 'encrypted_db';
+        document.getElementById('relayer-key-saved').textContent =
+            hasDb ? '•••••• 已保存' : '';
+        document.getElementById('relayer-secret-saved').textContent =
+            hasDb ? '•••••• 已保存' : '';
+        document.getElementById('relayer-passphrase-saved').textContent =
+            hasDb ? '•••••• 已保存' : '';
+    }).catch(() => {});
+}
+
+function renderRelayerResults(results) {
+    const box = document.getElementById('relayer-test-results');
+    if (!results || !results.length) {
+        box.innerHTML = '';
+        return;
+    }
+    const rows = results.map(r => {
+        const color = r.ready ? '#080' : '#c00';
+        const addr = r.wallet ? (r.wallet.slice(0, 6) + '...' + r.wallet.slice(-4)) : '?';
+        const deployed = r.deposit_wallet_deployed === false
+            ? ' · <span style="color:#c60">Deposit Wallet 未部署</span>' : '';
+        return `<tr>
+            <td title="${escapeHtml(r.wallet || '')}">${addr}</td>
+            <td style="color:${color}">${r.ready ? '验证通过' : '验证失败'}</td>
+            <td>${escapeHtml(r.reason_cn || r.reason || '')}${deployed}</td>
+        </tr>`;
+    }).join('');
+    box.innerHTML =
+        '<table class="data-table"><thead><tr><th>钱包</th><th>结果</th><th>说明</th></tr></thead>' +
+        '<tbody>' + rows + '</tbody></table>';
+}
+
+function saveRelayerConfig() {
+    const apiKey = document.getElementById('relayer-api-key').value.trim();
+    const secret = document.getElementById('relayer-secret').value.trim();
+    const passphrase = document.getElementById('relayer-passphrase').value.trim();
+    if (!apiKey || !secret || !passphrase) {
+        alert('Builder API Key / Secret / Passphrase 三项都必须填写');
+        return;
+    }
+    fetch('/api/relayer-config', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            builder_api_key: apiKey,
+            builder_secret: secret,
+            builder_passphrase: passphrase,
+            test: true,
+        }),
+    }).then(r => r.json().then(data => ({status: r.status, data})))
+      .then(({status, data}) => {
+        document.getElementById('relayer-api-key').value = '';
+        document.getElementById('relayer-secret').value = '';
+        document.getElementById('relayer-passphrase').value = '';
+        if (status === 400 || status === 422) {
+            alert(data.error || '保存失败');
+            renderRelayerResults(data.results || []);
+            return;
+        }
+        renderRelayerResults(data.results || []);
+        showToast('Relayer 凭据已加密保存');
+        loadRelayerConfig();
+        loadWallets();
+    });
+}
+
+function retestRelayerConfig() {
+    showToast('正在只读验证…');
+    fetch('/api/relayer-config/test', {method: 'POST'})
+        .then(r => r.json())
+        .then(data => {
+            renderRelayerResults(data.results || []);
+            loadRelayerConfig();
+            loadWallets();
+            if (data.message) showToast(data.message);
+        })
+        .catch(() => showToast('验证请求失败'));
+}
+
+function deleteRelayerConfig() {
+    if (!confirm('确定删除本地加密的 Relayer 凭据？钱包私钥、模板与历史不会受影响。')) return;
+    fetch('/api/relayer-config', {method: 'DELETE'})
+        .then(r => r.json())
+        .then(data => {
+            showToast(data.message || '已删除');
+            renderRelayerResults([]);
+            loadRelayerConfig();
+            loadWallets();
+        });
+}
 
 function addWallet() {
     const key = document.getElementById('new-private-key').value.trim();
@@ -889,6 +1070,7 @@ function toggleWallet(address, enabled) {
 }
 
 loadTemplates().then(() => { loadStrategy(currentTemplateId); loadWallets(); });
+loadRelayerConfig();
 loadEngine();
 </script>
 {% endblock %}

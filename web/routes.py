@@ -560,8 +560,12 @@ def api_set_wallet_template(address):
 @login_required
 def api_list_wallets():
     from api.ctf import relayer_configured
+    from api.relayer_config import wallet_merge_status
 
     wallets = db.list_wallets()
+    test_results = db.get_relayer_test_results() if db is not None else {}
+    db_creds = db.get_relayer_credentials() if db is not None else None
+    relayer_configured_flag = bool(db_creds) or relayer_configured()
     for w in wallets:
         encrypted_key = w.pop("encrypted_key", None)
         w["running"] = False
@@ -575,11 +579,6 @@ def api_list_wallets():
                 w["running"] = True
                 w["trading_enabled"] = getattr(eng.api, "trading_enabled", True)
                 w["trading_block_reason"] = getattr(eng.api, "trading_block_reason", "")
-                w["merge_available"] = bool(
-                    w.get("signature_type") == 3
-                    and w["trading_enabled"]
-                    and relayer_configured()
-                )
                 try:
                     w["balance"] = eng.api.get_balance()
                 except Exception:
@@ -596,14 +595,175 @@ def api_list_wallets():
                     w["balance"] = api.get_balance()
                     w["trading_enabled"] = getattr(api, "trading_enabled", True)
                     w["trading_block_reason"] = getattr(api, "trading_block_reason", "")
-                    w["merge_available"] = bool(
-                        w.get("signature_type") == 3
-                        and w["trading_enabled"]
-                        and relayer_configured()
-                    )
                 except Exception:
                     pass
+        template = db.get_template_for(w["address"]) if db is not None else {}
+        merge = wallet_merge_status(
+            w, template, relayer_configured_flag, test_results.get(w["address"])
+        )
+        w.update(merge)
     return jsonify(wallets)
+
+
+# --- API: Merge / Relayer authorization (encrypted app-level config) ---
+
+
+def _preflight_wallets(config_override=None):
+    """Read-only preflight over every enabled Type3 wallet.
+
+    Never mutates chain/CLOB state (see api.relayer_config.run_wallet_preflight).
+    """
+    from api.relayer_config import preflight_all_wallets
+
+    def private_key_for(wallet):
+        try:
+            return decrypt(wallet["encrypted_key"], encryption_key)
+        except Exception:
+            return None
+
+    def trading_for(wallet):
+        if manager and manager.engines.get(wallet["address"]):
+            eng = manager.engines[wallet["address"]]
+            return bool(getattr(eng.api, "trading_enabled", True))
+        try:
+            api = _get_cached_api(
+                wallet["address"],
+                wallet["encrypted_key"],
+                wallet.get("funder", ""),
+                wallet.get("signature_type", 2),
+                wallet.get("proxy", ""),
+            )
+            return bool(getattr(api, "trading_enabled", True))
+        except Exception:
+            # API construction failure is not evidence of a disabled account;
+            # the import-time and engine-start checks already validated it.
+            return True
+
+    return preflight_all_wallets(
+        db,
+        encryption_key,
+        private_key_for=private_key_for,
+        trading_enabled_for=trading_for,
+        config_override=config_override,
+    )
+
+
+def _persist_preflight_results(results):
+    """Store read-only test outcomes for display; prune stale wallet rows."""
+    for r in results:
+        db.save_relayer_test_result(
+            r.wallet,
+            r.ready,
+            r.reason,
+            deposit_wallet_deployed=r.deposit_wallet_deployed,
+            at=r.tested_at,
+        )
+    known = {w["address"] for w in db.list_wallets()}
+    for wallet in list(db.get_relayer_test_results().keys()):
+        if wallet not in known:
+            db.delete_relayer_test_result(wallet)
+
+
+@app.route("/api/relayer-config", methods=["GET"])
+@login_required
+def api_relayer_config_get():
+    """Non-secret metadata only: never api_key/secret/passphrase/ciphertext."""
+    from api.relayer_config import relayer_status_metadata
+
+    return jsonify(relayer_status_metadata(db, encryption_key))
+
+
+@app.route("/api/relayer-config", methods=["POST"])
+@login_required
+def api_relayer_config_save():
+    """Save the Builder credential trio after server-side validation.
+
+    The old trio is overwritten atomically only after validation passes; a
+    failed credential-level test keeps the previous trio intact.
+    """
+    from api.relayer_config import (
+        RELAYER_DEFAULT_URL,
+        RelayerRuntimeConfig,
+        encrypt_credential_trio,
+    )
+
+    data = request.get_json(silent=True) or {}
+    api_key = str(data.get("builder_api_key") or "").strip()
+    secret = str(data.get("builder_secret") or "").strip()
+    passphrase = str(data.get("builder_passphrase") or "").strip()
+    if not (api_key and secret and passphrase):
+        return (
+            jsonify(
+                {"error": "Builder API Key / Secret / Passphrase 三项都必须填写"}
+            ),
+            400,
+        )
+    if encryption_key is None:
+        return jsonify({"error": "尚未登录，无法加密保存"}), 400
+
+    candidate = RelayerRuntimeConfig(
+        url=os.environ.get("PMM_RELAYER_URL") or RELAYER_DEFAULT_URL,
+        builder_key=api_key,
+        builder_secret=secret,
+        builder_passphrase=passphrase,
+        rpc_url=os.environ.get("PMM_POLYGON_RPC_URL") or None,
+    )
+    results = None
+    if data.get("test", True):
+        results = _preflight_wallets(config_override=candidate)
+        from api.relayer_config import _CREDENTIAL_LEVEL_FAILURES
+
+        if results and all(
+            r.reason in _CREDENTIAL_LEVEL_FAILURES for r in results
+        ):
+            return (
+                jsonify(
+                    {
+                        "error": "凭据验证失败，旧配置保持不变",
+                        "results": [r.to_dict() for r in results],
+                    }
+                ),
+                422,
+            )
+
+    encrypted = encrypt_credential_trio(api_key, secret, passphrase, encryption_key)
+    db.save_relayer_credentials(*encrypted)
+    if results:
+        _persist_preflight_results(results)
+    return jsonify(
+        {
+            "ok": True,
+            "message": "Relayer 凭据已加密保存（登录后自动解密使用）",
+            "results": [r.to_dict() for r in results] if results else None,
+        }
+    )
+
+
+@app.route("/api/relayer-config/test", methods=["POST"])
+@login_required
+def api_relayer_config_test():
+    """Re-run the read-only preflight against the currently active config."""
+    results = _preflight_wallets()
+    _persist_preflight_results(results)
+    if not results:
+        return jsonify({"ok": True, "results": [], "message": "没有可验证的 Type3 钱包"})
+    return jsonify({"ok": True, "results": [r.to_dict() for r in results]})
+
+
+@app.route("/api/relayer-config", methods=["DELETE"])
+@login_required
+def api_relayer_config_delete():
+    """Delete only the encrypted DB credentials; ENV config falls back."""
+    from api.relayer_config import relayer_status_metadata
+
+    db.delete_relayer_credentials()
+    db.delete_relayer_test_results()
+    meta = relayer_status_metadata(db, encryption_key)
+    if meta["source"] == "env":
+        message = "已删除本地加密凭据，当前使用环境变量配置"
+    else:
+        message = "已删除本地加密凭据，Merge 需重新配置 Relayer 授权"
+    return jsonify({"ok": True, "message": message, **meta})
 
 
 def _clean_private_key(raw: str):

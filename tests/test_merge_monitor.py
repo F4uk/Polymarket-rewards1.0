@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from engine.monitor import OrderMonitor
 from engine.take_profit import remaining_fifo_lots
+from api.polymarket_api import OrderRejected
 
 
 CID = "0x" + "c" * 64
@@ -158,3 +159,22 @@ def test_restart_fifo_replay_uses_prior_confirmed_merge_journal():
     earlier = [{"side": "MERGE", "size": 12, "ts": 2}]
     lots = remaining_fifo_lots(fills, earlier)
     assert lots == [{"price": 0.30, "remaining": 8.0, "ts": 1.0, "trade_id": ""}]
+
+
+def test_rejected_urgent_fok_creates_no_inventory_and_returns_direct_exit_path():
+    monitor, api, db = _monitor()
+    api.get_market.return_value = {
+        "tokens": [{"token_id": "yes", "outcome": "Yes"}, {"token_id": "no", "outcome": "No"}]
+    }
+    api.get_orderbook.side_effect = [
+        {"bids": [{"price": "0.20", "size": "10"}], "asks": [], "tick_size": "0.01"},
+        {"bids": [], "asks": [{"price": "0.50", "size": "10"}], "tick_size": "0.01"},
+    ]
+    api.place_complement_fok_buy.side_effect = OrderRejected("unmatched")
+    db.create_merge_operation.return_value = 29
+
+    with patch.object(monitor, "_merge_client", return_value=MagicMock()):
+        assert monitor._urgent_merge_route(CID, "yes", 10, "0.01") is None
+
+    assert db.update_merge_operation.call_args.args[:2] == (29, "failed")
+    api.place_market_sell.assert_not_called()

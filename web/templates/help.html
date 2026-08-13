@@ -29,10 +29,32 @@
     <h2>Merge 安全边界</h2>
     <ul>
         <li>仅处理普通二元市场；negRisk 或多结果市场不会自动 Merge。</li>
-        <li>自动 Merge 仅适用于 POLY_1271 Deposit Wallet（Type3），并且需要显式配置 Relayer。Type1/Type2 仍可正常做市，但自动 Merge 不可用。</li>
+        <li>自动 Merge 仅适用于 POLY_1271 Deposit Wallet（Type3），并且需要显式配置 Builder/Relayer 授权。Type1/Type2 仍可正常做市，但自动 Merge 不适用。</li>
         <li>提交前会撤销冲突 SELL 并重新确认仓位；Relayer 确认前不当作已合并。</li>
         <li>完整配对始终保留给 Merge，不会被低余额清仓或常规离场拆散。</li>
         <li>首次 Merge 会在同一 Deposit Wallet 批处理中给官方适配器设置 CTF ERC-1155 授权。</li>
+    </ul>
+</section>
+
+<section class="config-section">
+    <h2>Merge / Relayer 授权</h2>
+    <ul>
+        <li><b>首次配置一次，之后自动加载。</b>在「配置」页的「Merge / Relayer 授权」里填一次
+            Builder API Key / Secret / Passphrase，凭据会用登录密码派生的密钥 AES 加密后存库；
+            之后每次登录都会自动解密使用，不再需要 SSH 手工编辑服务器环境变量。</li>
+        <li>Builder 凭据必须在 <code>polymarket.com/settings</code> 的 Builder 页面自行创建，
+            无法从钱包私钥推导生成。</li>
+        <li>普通用户无需填写 Relayer URL：默认使用官方
+            <code>https://relayer-v2.polymarket.com/</code>；高级部署仍可用
+            <code>PMM_RELAYER_URL</code> 覆盖，缺少它也不会让 Merge 不可用。</li>
+        <li>「保存并测试 / 重新测试」只做只读验证：本地派生 Deposit Wallet、比对存款地址、
+            Relayer 认证读 nonce、确认 CLOB 交易可用；不会部署钱包、不会提交 Merge、不会下单。</li>
+        <li>状态一目了然：未配置 / 已配置未验证 / 验证成功 / 验证失败；钱包列表按钱包独立显示
+            「Merge 可用」「Merge 已关闭（模板）」「Merge 不可用 · 原因」。</li>
+        <li>服务器部署仍支持 <code>PMM_BUILDER_API_KEY / PMM_BUILDER_SECRET /
+            PMM_BUILDER_PASSPHRASE</code> 环境变量；UI 加密配置优先，环境变量是回退来源，
+            两者不会互相覆盖。</li>
+        <li>Relayer API Key 认证是平台的另一种认证方式，本版 UI 暂不开放（KNOWN_LIMITATIONS）。</li>
     </ul>
 </section>
 

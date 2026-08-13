@@ -51,7 +51,8 @@ Built for **non-technical users**: install, double-click, a browser opens, you s
 - **账户净值曲线**：引擎运行期间每个钱包每天记一次净值（现金 + 持仓市值），「资产曲线」页看历史走势，也可查任意某天的净值。
 - **全局黑名单**：在下单 / 扫描 / 监控三处统一拦截不想参与的市场。
 - **私钥本地加密**：钱包私钥用 AES-256-GCM 加密，密钥由你的密码经 PBKDF2（60 万次迭代）派生，仅存在于内存。
-- **Merge-first（Type3）**：普通二元市场的已确认 YES+NO 完整集合优先通过官方 Relayer Deposit Wallet 路径合并；数量不等时先 Merge 配对部分、只处理 residual。严重亏损会比较 direct SELL 与受保护的 FOK 补对侧 + Merge，选择少亏路线。自动 Merge 仅适用于已配置 Relayer 的 POLY_1271 Deposit Wallet；Type1/Type2 仍可正常做市，只是自动 Merge 不可用。
+- **Merge-first（Type3）**：普通二元市场的已确认 YES+NO 完整集合优先通过官方 Relayer Deposit Wallet 路径合并；数量不等时先 Merge 配对部分、只处理 residual。严重亏损会比较 direct SELL 与受保护的 FOK 补对侧 + Merge，选择少亏路线。自动 Merge 仅适用于已配置 Builder/Relayer 授权的 POLY_1271 Deposit Wallet；Type1/Type2 仍可正常做市，只是自动 Merge 不适用。
+- **Merge / Relayer 授权（Web 配置，加密存储）**：Builder API Key / Secret / Passphrase 在「配置」页配置一次，用登录密码派生的密钥 AES 加密后存库（`relayer_credentials` 表，绝不明文落库），之后登录自动解密使用；普通用户无需填写 Relayer URL（默认官方 `https://relayer-v2.polymarket.com/`）。「保存并测试 / 重新测试」只做只读验证（派生 Deposit Wallet、比对存款地址、认证读 nonce、确认交易可用），不会部署钱包、不提交 Merge、不下单。服务器部署仍可用 `PMM_BUILDER_API_KEY / PMM_BUILDER_SECRET / PMM_BUILDER_PASSPHRASE / PMM_POLYGON_RPC_URL` 环境变量，UI 加密配置优先、ENV 回退，二者互不覆盖。
 
 > Gap-tier single-rung placement with per-tier modules keyed by the market's minimum reward size (each module carries its own share count and gating thresholds — a market whose minimum size matches no enabled module is never placed), per-wallet strategy templates, Merge-first handling for ordinary binary Type3 positions, position-driven exit that never sells below a cost reconstructed from real fills, a daily net-worth history per wallet, a global blacklist enforced at three choke points, and AES-256-GCM encrypted keys held only in memory.
 

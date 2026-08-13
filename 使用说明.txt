@@ -14,7 +14,13 @@ Polymarket 做市助手 — 使用说明
     补全优势不足 0.01 USD 时不采用；FOK 未确认或结果不确定时等待库存对账，
     不会假设已经获得完整配对。
   · 自动 Merge 默认开启，最小 Merge 份数默认 1；仅 POLY_1271 Deposit Wallet
-    （Type3）且配置 Relayer 时可用。Type1/Type2 仍可正常做市，只是不自动 Merge。
+    （Type3）且配置 Builder/Relayer 授权时可用。Type1/Type2 仍可正常做市，只是不自动 Merge。
+  · Builder 凭据（API Key / Secret / Passphrase）在「配置 → Merge / Relayer 授权」
+    配置一次即可：登录后自动解密使用，无需手工编辑服务器环境变量。凭据用登录密码
+    派生的密钥 AES 加密后存库，绝不落明文；普通用户无需填写 Relayer URL（默认官方
+    https://relayer-v2.polymarket.com/）。「保存并测试 / 重新测试」只做只读验证，
+    不会部署钱包、不会提交 Merge、不会下单。服务器部署仍可用 PMM_BUILDER_* 环境变量
+    （UI 加密配置优先，ENV 自动回退）。
   · low_balance_threshold_usd 默认 0，表示关闭自动低余额清仓。
 
 下文保留部分早期界面讲解；若与上面或应用内“使用说明”不一致，以当前界面为准。
@@ -193,7 +199,11 @@ Polymarket 为了让市场有人气，会每天拿出一笔奖励，发给那些
     - 最短结算天数：离市场结算太近就不参与（避免临近结算的波动）。
     - 止损方式：可按成本比例、固定美分阈值，或关闭；完整配对仍先 Merge。
     - 自动 Merge：默认开启；最小份数默认 1，紧急补全优势下限默认 0.01 USD。
-      仅 Type3 Deposit Wallet + Relayer 可用，Type1/Type2 常规做市不受影响。
+      仅 Type3 Deposit Wallet + Builder/Relayer 授权可用，Type1/Type2 常规做市不受影响。
+    - Merge / Relayer 授权：独立区域，不属于任何模板。首次填一次 Builder 三项凭据，
+      加密保存后登录自动加载；可「保存并测试 / 重新测试 / 删除本地凭据」。状态区分
+      未配置 / 已配置未验证 / 验证成功 / 验证失败，钱包列表按钱包显示
+      Merge 可用 / Merge 已关闭（模板）/ Merge 不可用 · 原因。
     - 低余额触发线：默认 0 = 关闭，不会自动因低余额卖仓。
 
    ◆ 运行参数（决定“多久跑一次、节奏快慢”）

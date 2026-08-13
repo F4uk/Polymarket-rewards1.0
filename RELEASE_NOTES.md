@@ -1,6 +1,47 @@
 > **当前更新方式：** 以下各版本条目是历史发布记录。运行中的应用已经移除
 > GitHub 检查与自动安装/回滚功能；版本更新只能由管理员显式部署并验证。
 
+## v8.4.0 · Merge / Relayer 授权：Web 配置一次，加密存储，之后自动加载
+
+**行为变化：自动 Merge 不再要求 SSH 手工配置环境变量。** Type3 钱包现在可以在
+「配置 → Merge / Relayer 授权」里填一次 Builder API Key / Secret / Passphrase，
+登录后自动解密使用。资金核心（merge calldata、CTF adapter、条件锁、Merge 账本、
+FIFO、PnL、FOK 出口、post-only 奖励买、结算竞态防护）零改动。
+
+### 加密存储与来源优先级
+
+- 新增单行表 `relayer_credentials`（`integration_secrets` 概念的专用实现）：
+  三项凭据用登录密码派生的 `encryption_key` 逐项 AES-256-GCM 加密后**一次事务**
+  原子写入；任何情况下 SQLite 文件里没有明文 secret。
+- 来源优先级（已测试、已文档化）：**① 加密 DB 凭据 → ② 环境变量 → ③ 不可用**。
+  ENV 只作回退、绝不自动复制进 DB；删除 DB 凭据后自动回落 ENV，原有 systemd/ENV
+  部署升级后继续工作，无需改配置。
+- Relayer URL 有官方默认值 `https://relayer-v2.polymarket.com/`，普通用户不再需要
+  填写；`PMM_RELAYER_URL` 仍可覆盖，缺失不再导致 Merge 不可用。
+
+### 只读验证（保存并测试 / 重新测试）
+
+- 每个启用 Type3 钱包独立验证：派生 Deposit Wallet → 比对 `wallets.funder` →
+  认证读 nonce → CLOB 交易可用。绝不部署钱包、绝不提交 Merge、绝不下单。
+- 钱包列表按钱包显示「Merge 可用 / Merge 已关闭（模板）/ Merge 不可用 · 原因」，
+  区分**钱包能力**（`merge_capable`）与**模板开关**（`merge_enabled`）。
+- 保存凭据前先验证：验证失败返回 422，旧三件套完整保留。
+- 顺带只读展示 Deposit Wallet 部署状态（`get_deployed`），未部署仅提示、不自动部署。
+
+### 安全
+
+- GET `/api/relayer-config` 只返回非敏感元数据，绝不返回 key/secret/passphrase/ciphertext；
+  POST/DELETE 均需登录；密码框不预填真实 secret，无「显示密码 / 复制 Secret」按钮。
+- 凭据不进 settings JSON、不进日志、不进 `.env`、不进浏览器存储；
+  `RelayerRuntimeConfig.__repr__` 已脱敏；异常输出统一归类为中文原因码。
+- 测试凭据全部为明显假值（`test-builder-key` 等），secret scan 通过。
+
+### 已知限制（KNOWN_LIMITATIONS）
+
+- **Relayer API Key 认证**：平台已支持，但当前安装的
+  `py-builder-relayer-client 0.0.2` 无现成接入，本 V1 UI 不开放；Builder 凭据路径
+  是唯一的 Web 可配置认证方式。
+
 ## v8.3.0 · 新市场保护可以按品类勾选了
 
 **升级后行为不变。** 新增的品类勾选默认全选，跟你现在的设置完全等价；要不要缩小范围，是你主动去点的事。

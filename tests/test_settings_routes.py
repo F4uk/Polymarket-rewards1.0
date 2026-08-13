@@ -141,3 +141,21 @@ def test_dead_template_keys_no_longer_stored(tmp_path, monkeypatch):
     client.post("/api/settings", json={"rule1_min_coeff": 9, "amount_value_table": []})
     tmpl = db.get_template(db.get_default_template_id())
     assert "rule1_min_coeff" not in tmpl and "amount_value_table" not in tmpl
+
+
+def test_settings_endpoint_rejects_invalid_merge_numeric_without_partial_save(
+    tmp_path, monkeypatch
+):
+    client, db = _client_with_db(tmp_path, monkeypatch)
+    tid = db.get_default_template_id()
+    original_exposure = db.get_template(tid)["max_exposure_usd"]
+
+    response = client.post(
+        "/api/settings",
+        json={"max_exposure_usd": 999, "merge_min_shares": None},
+    )
+
+    assert response.status_code == 400
+    template = db.get_template(tid)
+    assert template["merge_min_shares"] == 1.0
+    assert template["max_exposure_usd"] == original_exposure

@@ -17,9 +17,11 @@
     <ol>
         <li>扫描奖励市场并按模板的价格、价差、结算时间和品类筛选。</li>
         <li>只挂 GTC post-only BUY 单；单子会因价差、奖励或结算状态变化而被撤销。</li>
-        <li>成交后暂停该 token 的新 BUY，留下的仓位由监控逻辑处理。</li>
-        <li>普通二元市场的完整 Yes/No 对会优先合并回 $1；仅 Type 3 Deposit Wallet 且 Relayer 已显式配置时可用。</li>
-        <li>非配对的残余仓位才进入离场逻辑。成本无法从实际成交重建时，程序会跳过而不会猜测资产平均价。</li>
+        <li>成交后只暂停已成交 token/side 的新 BUY；同市场对侧奖励 BUY 仍可继续挂单、维护和赚取奖励。</li>
+        <li>普通二元市场一旦同时持有 YES+NO，完整集合会先 Merge。数量不等时先 Merge 配对部分，只让单边 residual 进入离场逻辑。</li>
+        <li>普通单边仓允许两条路径并存：对侧 reward BUY 继续等待自然配对，本侧 maker SELL 同时按成本保护退出；先成交的一条路径生效。</li>
+        <li>严重亏损时比较 direct SELL 与受价格保护的 FOK 补对侧 + Merge，只在后者超过优势下限、能少亏更多时选择补全；FOK 未确认成交或结果不确定时不会假设已经配对。</li>
+        <li>成本无法从实际成交重建时，程序会跳过而不会猜测 Data API 平均价。</li>
     </ol>
 </section>
 
@@ -27,9 +29,20 @@
     <h2>Merge 安全边界</h2>
     <ul>
         <li>仅处理普通二元市场；negRisk 或多结果市场不会自动 Merge。</li>
+        <li>自动 Merge 仅适用于 POLY_1271 Deposit Wallet（Type3），并且需要显式配置 Relayer。Type1/Type2 仍可正常做市，但自动 Merge 不可用。</li>
         <li>提交前会撤销冲突 SELL 并重新确认仓位；Relayer 确认前不当作已合并。</li>
         <li>完整配对始终保留给 Merge，不会被低余额清仓或常规离场拆散。</li>
         <li>首次 Merge 会在同一 Deposit Wallet 批处理中给官方适配器设置 CTF ERC-1155 授权。</li>
+    </ul>
+</section>
+
+<section class="config-section">
+    <h2>Merge 参数</h2>
+    <ul>
+        <li><b>启用自动 Merge</b>：默认开启；取消勾选后只关闭该模板的自动 Merge，不影响 Type1/Type2 或 Type3 的常规做市。</li>
+        <li><b>最小 Merge 份数</b>：默认 1；配对数量小于它时不提交 Merge。</li>
+        <li><b>紧急补全优势下限</b>：默认 0.01 USD；只有“FOK 补对侧 + Merge”比直接卖至少多保住这么多价值，才选择补全。</li>
+        <li><b>低余额触发线</b>（<code>low_balance_threshold_usd</code>）：默认 0，即关闭自动低余额清仓。</li>
     </ul>
 </section>
 

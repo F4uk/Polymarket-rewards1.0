@@ -3,6 +3,7 @@
 import os
 import re
 import sys
+import math
 import hashlib
 import logging
 import sqlite3
@@ -34,6 +35,39 @@ from web.wallet_import import ImportJob, parse_import_lines
 from version import __version__
 
 logger = logging.getLogger(__name__)
+
+_MERGE_NUMERIC_RULES = {
+    "merge_min_shares": "最小 Merge 份数",
+    "merge_advantage_min_usd": "紧急补全优势下限",
+}
+
+
+def _validate_merge_template_values(strategy: dict):
+    """Reject missing/non-finite/negative Merge controls before persistence.
+
+    These values select whether a funds-moving route is eligible.  Accepting
+    JSON ``null`` (the browser representation of NaN) and later coercing it to
+    zero would silently weaken the saved strategy, so both template-writing
+    endpoints share this fail-closed check.
+    """
+    if "merge_enabled" in strategy and not isinstance(
+        strategy["merge_enabled"], bool
+    ):
+        return "启用自动 Merge 必须是布尔值"
+    for key, label in _MERGE_NUMERIC_RULES.items():
+        if key not in strategy:
+            continue
+        value = strategy[key]
+        if isinstance(value, bool):
+            return f"{label}必须是大于或等于 0 的有效数字"
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return f"{label}必须是大于或等于 0 的有效数字"
+        if not math.isfinite(number) or number < 0:
+            return f"{label}必须是大于或等于 0 的有效数字"
+        strategy[key] = number
+    return None
 
 # When packaged by PyInstaller the source tree isn't on disk; templates and
 # static files are bundled under sys._MEIPASS/web/. In dev, _MEIPASS is absent
@@ -401,6 +435,9 @@ def api_save_settings():
     data = request.get_json() or {}
     engine = {k: v for k, v in data.items() if k in ENGINE_DEFAULTS}
     strategy = {k: v for k, v in data.items() if k in TEMPLATE_DEFAULTS}
+    merge_error = _validate_merge_template_values(strategy)
+    if merge_error:
+        return jsonify({"error": merge_error}), 400
     if "size_tiers" in strategy:
         from engine.tiers import validate_size_tiers
 
@@ -471,6 +508,9 @@ def api_save_template(tid):
 
     data = request.get_json() or {}
     strategy = {k: v for k, v in data.items() if k in TEMPLATE_DEFAULTS}
+    merge_error = _validate_merge_template_values(strategy)
+    if merge_error:
+        return jsonify({"error": merge_error}), 400
     if "size_tiers" in strategy:
         from engine.tiers import validate_size_tiers
 

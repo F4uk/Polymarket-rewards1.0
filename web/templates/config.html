@@ -127,23 +127,25 @@
         </div>
 
         <h3>Merge-first</h3>
-        <p class="hint" style="color:#888;font-size:12px">仅支持同一普通二元市场的 YES+NO 完整集合；Type3 存款钱包且配置 Relayer 时才会自动提交。完整集合优先合并，不因低余额或止损单边卖出。</p>
+        <p class="hint" style="color:#888;font-size:12px">仅支持同一普通二元市场的 YES+NO 完整集合；自动 Merge 仅适用于 POLY_1271 Deposit Wallet（Type3）且必须配置 Relayer。Type1/Type2 仍可正常做市，只是不会自动 Merge。完整集合优先合并，不因低余额或止损单边卖出。</p>
         <div class="form-grid">
             <div class="form-group">
-                <label><input type="checkbox" name="merge_enabled" style="width:auto"> 启用自动 Merge</label>
+                <label><input type="checkbox" name="merge_enabled" style="width:auto"> 启用自动 Merge（默认：开）</label>
             </div>
             <div class="form-group">
                 <label>最小 Merge 份数</label>
-                <input type="number" name="merge_min_shares" step="0.001" min="0">
+                <input type="number" name="merge_min_shares" step="0.001" min="0" required>
+                <span class="hint">默认 1；配对数量小于此值时不提交 Merge。</span>
             </div>
             <div class="form-group">
                 <label>紧急补全优势下限 (USD)</label>
-                <input type="number" name="merge_advantage_min_usd" step="0.01" min="0">
+                <input type="number" name="merge_advantage_min_usd" step="0.01" min="0" required>
+                <span class="hint">默认 0.01；只有 FOK 补对侧再 Merge 比直接卖至少多保住这么多价值时才采用。</span>
             </div>
         </div>
 
         <h3>低余额清仓（腾现金）</h3>
-        <p class="hint" style="color:#888;font-size:12px">现金余额低于「触发线」时，按优先级逐笔<b>市价卖</b>持仓腾现金（会低于成本认亏）：先卖所在市场奖励低于阈值的、再卖份额小的、最后按亏损从小到大。触发线设 <b>0 = 关闭</b>。</p>
+        <p class="hint" style="color:#888;font-size:12px">现金余额低于「触发线」时，按优先级逐笔<b>市价卖</b>持仓腾现金（会低于成本认亏）：先卖所在市场奖励低于阈值的、再卖份额小的、最后按亏损从小到大。触发线默认 <b>0 = 关闭</b>。</p>
         <div class="form-grid">
             <div class="form-group">
                 <label>触发线（余额低于此值 U 就清仓，0=关闭）</label>
@@ -574,6 +576,19 @@ document.getElementById('strategy-form').addEventListener('submit', function(e) 
     this.querySelectorAll('input[type=number][name]').forEach(inp => {
         data[inp.name] = parseFloat(inp.value);
     });
+    const mergeEnabled = this.querySelector('[name="merge_enabled"]');
+    data.merge_enabled = !!(mergeEnabled && mergeEnabled.checked);
+    for (const [key, label] of [
+        ['merge_min_shares', '最小 Merge 份数'],
+        ['merge_advantage_min_usd', '紧急补全优势下限'],
+    ]) {
+        if (!Number.isFinite(data[key]) || data[key] < 0) {
+            alert(`${label}必须填写大于或等于 0 的有效数字`);
+            const input = this.querySelector(`[name="${key}"]`);
+            if (input) input.focus();
+            return;
+        }
+    }
     // 最长结算天数留空 -> parseFloat('')=NaN -> JSON null(不限);填了就必须 >= 最短,
     // 否则结算窗口为空、什么都挂不上。
     if (!isNaN(data.max_settlement_days) && data.max_settlement_days < data.min_settlement_days) {
@@ -680,7 +695,7 @@ function loadWallets() {
             <tr>
                 <td title="${w.address}">${w.address.slice(0,6)}...${w.address.slice(-4)}</td>
                 <td>${w.balance != null ? '$' + w.balance.toFixed(2) : '-'}</td>
-                <td title="${escapeHtml(w.trading_block_reason || '')}">${ACCT_TYPES[w.signature_type] || ('sig=' + w.signature_type)}<br><small>${w.signature_type === 3 ? (w.merge_available ? 'Merge 可用' : 'Merge 不可用') : 'Merge 仅 Type3'}</small></td>
+                <td title="${escapeHtml(w.trading_block_reason || '')}">${ACCT_TYPES[w.signature_type] || ('sig=' + w.signature_type)}<br><small>${w.signature_type === 3 ? (w.merge_available ? 'Merge 可用' : 'Merge 不可用') : '做市可用 · 自动 Merge 仅 Type3'}</small></td>
                 <td title="${w.funder || ''}">${w.funder ? w.funder.slice(0,6)+'...'+w.funder.slice(-4) : '-'}</td>
                 <td title="${w.proxy || ''}">${proxyLabel(w.proxy)}</td>
                 <td title="${escapeHtml(w.address)}">${escapeHtml(w.remark || '')}</td>

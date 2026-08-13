@@ -46,11 +46,12 @@ Built for **non-technical users**: install, double-click, a browser opens, you s
 - **档位模块（按最低奖励份额精确匹配）**：挂单参数按「市场最低奖励份额」逐档配置，每个模块自带挂单份数（可大于该市场最低份数）、三级选档门槛、高位系数和门槛、金额数值表。市场的最低份额必须**恰好等于**某个已启用模块的档位值才会做，没有模块对得上就不挂。
 - **奖励做市选品**：按最低奖励、结算天数、价格区间、买卖价差、品类白名单、冷却时间过滤；并按竞争度（competitiveness）从低到高优先下单（竞争越少奖励份额越大）。
 - **每钱包独立策略模板**：多模板增删改，每个钱包绑定自己的参数模板（阈值 / 敞口 / 离场 / 档位模块各自可调）。
-- **持仓驱动的两段式离场**：成本价由真实 CLOB 成交逐笔重建（FIFO 净额，绝不用 Data API avgPrice），每个持仓**始终只挂一张**卖单，且**永不低于成本卖出**。成本 ≤ 买一（浮盈）挂卖一做 maker 吃价差；成本 > 买一（保本 / 套牢）挂成本价等回本。唯一认亏出口是强平兜底：亏损达到止损线（按比例，默认成本的 20%；或按固定美分）时市价清仓。成本无法可靠重建时**跳过并显著告警**（⚠️裸奔，绝不按不确定成本卖出，自愈式重试）。
+- **单侧成交暂停**：成交后只暂停已成交 token/side 的新 BUY，对侧奖励 BUY 继续维护；普通单边仓可同时等待对侧 reward BUY 与本侧 maker SELL，哪条路径先成交就先处理。
+- **持仓驱动的两段式离场**：成本价由真实 CLOB 成交逐笔重建（FIFO 净额，绝不用 Data API avgPrice），每个持仓**始终只挂一张**卖单，且**永不低于成本卖出**。成本 ≤ 买一（浮盈）挂卖一做 maker 吃价差；成本 > 买一（保本 / 套牢）挂成本价等回本。认亏出口包括强平兜底（亏损达到止损线——按比例默认成本 20%，或按固定美分——市价清仓），以及严重亏损时在 direct SELL 与受保护 FOK 补对侧 + Merge 之间选择少亏路线。成本无法可靠重建时**跳过并显著告警**（⚠️裸奔，绝不按不确定成本卖出，自愈式重试）。
 - **账户净值曲线**：引擎运行期间每个钱包每天记一次净值（现金 + 持仓市值），「资产曲线」页看历史走势，也可查任意某天的净值。
 - **全局黑名单**：在下单 / 扫描 / 监控三处统一拦截不想参与的市场。
 - **私钥本地加密**：钱包私钥用 AES-256-GCM 加密，密钥由你的密码经 PBKDF2（60 万次迭代）派生，仅存在于内存。
-- **Merge-first（Type3）**：普通二元市场的已确认 YES+NO 完整集合优先通过官方 Relayer Deposit Wallet 路径合并；缺少 Relayer 配置或 Type3 验证失败时不伪造成功。
+- **Merge-first（Type3）**：普通二元市场的已确认 YES+NO 完整集合优先通过官方 Relayer Deposit Wallet 路径合并；数量不等时先 Merge 配对部分、只处理 residual。严重亏损会比较 direct SELL 与受保护的 FOK 补对侧 + Merge，选择少亏路线。自动 Merge 仅适用于已配置 Relayer 的 POLY_1271 Deposit Wallet；Type1/Type2 仍可正常做市，只是自动 Merge 不可用。
 
 > Gap-tier single-rung placement with per-tier modules keyed by the market's minimum reward size (each module carries its own share count and gating thresholds — a market whose minimum size matches no enabled module is never placed), per-wallet strategy templates, Merge-first handling for ordinary binary Type3 positions, position-driven exit that never sells below a cost reconstructed from real fills, a daily net-worth history per wallet, a global blacklist enforced at three choke points, and AES-256-GCM encrypted keys held only in memory.
 
@@ -58,7 +59,7 @@ Built for **non-technical users**: install, double-click, a browser opens, you s
 
 ## 界面 / UI
 
-8 个页面、左侧边栏导航，支持**深 / 浅主题切换**（侧边栏底部按钮，选择记在浏览器本地，刷新保持）。
+9 个页面、左侧边栏导航，支持**深 / 浅主题切换**（侧边栏底部按钮，选择记在浏览器本地，刷新保持）。
 
 | 页面 | 内容 |
 | --- | --- |
@@ -70,8 +71,9 @@ Built for **non-technical users**: install, double-click, a browser opens, you s
 | 监控 | 每 4 秒刷新的实时监控快照（瞬时状态） |
 | 配置 | 钱包导入与模板绑定、多模板管理、策略参数、**档位模块卡片编辑器**、引擎参数（含 Type3 Merge 可用性状态） |
 | 黑名单 | 加入 / 移除不参与的市场 |
+| 使用说明 | 当前 Merge-First、钱包类型、参数默认值和安全边界说明 |
 
-> Eight sidebar screens with a light/dark theme toggle. Market Discovery expands into a live gap-tier preview (which rule the market fell into, per-rung price / book size / risk coefficient, the chosen rung and its share count, plus the reason when nothing is placed). The Config page edits size-tier modules as cards; the Net Worth page charts each wallet's daily balance history.
+> Nine sidebar screens with a light/dark theme toggle. Market Discovery expands into a live gap-tier preview (which rule the market fell into, per-rung price / book size / risk coefficient, the chosen rung and its share count, plus the reason when nothing is placed). The Config page edits size-tier modules as cards; the Net Worth page charts each wallet's daily balance history.
 
 ---
 
@@ -171,7 +173,7 @@ pytest tests/test_strategy.py     # 单个文件
 | --- | --- | --- |
 | `scan_interval_sec` | 30 | 自动模式下单轮间隔（秒） |
 | `fill_check_interval_sec` | 5 | 成交 / 监控检查间隔（秒） |
-| `cooldown_minutes` | 20 | 同市场成交后冷却（分钟） |
+| `cooldown_minutes` | 20 | 已成交 token/side 暂停新 BUY 的时间（分钟）；对侧奖励 BUY 继续 |
 | `rewards_cache_ttl_sec` | 0 | 奖励参数复查缓存 TTL（秒），0=每次实时取 |
 | `discovery_interval_sec` | 14400 | 市场发现间隔（秒，默认 4 小时） |
 | `reward_scan_max_pages` | 20 | 每品类奖励市场抓取页数上限（每页 100） |
@@ -197,9 +199,10 @@ pytest tests/test_strategy.py     # 单个文件
 | `take_profit_mode` | `maker` | 浮盈卖法：`maker` 挂卖一吃价差 / `market` 成本 < 买一时立即市价清仓 |
 | `max_exposure_usd` / `max_exposure_shares` | 250 / 500 | 单市场最大敞口（美元 / 份数） |
 | `max_concurrent_markets` | 10 | 最大并发做市市场数 |
-| `low_balance_threshold_usd` | 0 | 低余额市价清仓队列队值；0=关闭（默认） |
-| `merge_enabled` / `merge_min_shares` | `true` / 1.0 | 普通二元 Type3 完整集合合并开关 / 最小份额 |
-| `merge_advantage_min_usd` | 0.01 | 紧急补全 + Merge 相对直接出售的最小优势缓冲 |
+| `low_balance_threshold_usd` | 0 | 低余额市价清仓触发线；0=关闭（默认） |
+| `merge_enabled` | `true` | 启用自动 Merge（默认开）；仅 POLY_1271 Deposit Wallet + Relayer 可用，Type1/Type2 做市不受影响 |
+| `merge_min_shares` | 1.0 | 最小 Merge 份数；配对数量小于它时不提交 Merge |
+| `merge_advantage_min_usd` | 0.01 | 紧急补全优势下限（USD）；FOK 补对侧 + Merge 至少比直接 SELL 多保住此价值才采用 |
 
 **几个概念怎么算 / Key metrics**
 

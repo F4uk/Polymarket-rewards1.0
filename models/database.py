@@ -20,6 +20,19 @@ class ActiveMergeOperationExists(RuntimeError):
         )
 
 
+class ActiveExitCycleExists(RuntimeError):
+    """Raised when a wallet/condition already owns an active (non-CLOSED) exit cycle."""
+
+    def __init__(self, wallet: str, condition_id: str, cycle_id: int | None = None):
+        self.wallet = wallet
+        self.condition_id = condition_id
+        self.cycle_id = cycle_id
+        suffix = f" (cycle {cycle_id})" if cycle_id is not None else ""
+        super().__init__(
+            f"active exit cycle already exists for wallet={wallet} condition={condition_id}{suffix}"
+        )
+
+
 class Database:
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -251,6 +264,55 @@ class Database:
                 last_test_reason TEXT NOT NULL DEFAULT '',
                 deposit_wallet_deployed INTEGER
             );
+            CREATE TABLE IF NOT EXISTS inventory_exit_cycles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                trigger TEXT NOT NULL DEFAULT 'reward_fill',
+                held_side TEXT NOT NULL DEFAULT '',
+                held_asset_id TEXT NOT NULL DEFAULT '',
+                managed_qty REAL NOT NULL DEFAULT 0,
+                initial_qty REAL NOT NULL DEFAULT 0,
+                cost_basis REAL,
+                paired_qty REAL NOT NULL DEFAULT 0,
+                direct_recovery REAL,
+                merge_recovery REAL,
+                advantage REAL,
+                selected_route TEXT NOT NULL DEFAULT '',
+                maker_window_until REAL,
+                realized_recovered_collateral REAL NOT NULL DEFAULT 0,
+                inventory_pnl REAL NOT NULL DEFAULT 0,
+                holding_duration_sec REAL NOT NULL DEFAULT 0,
+                closed_reason TEXT NOT NULL DEFAULT '',
+                error TEXT NOT NULL DEFAULT '',
+                opened_at REAL NOT NULL,
+                closed_at REAL,
+                updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS inventory_exit_legs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cycle_id INTEGER NOT NULL,
+                wallet TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                exit_method TEXT NOT NULL DEFAULT '',
+                asset_id TEXT NOT NULL DEFAULT '',
+                side TEXT NOT NULL DEFAULT '',
+                qty REAL NOT NULL,
+                price REAL NOT NULL DEFAULT 0,
+                collateral REAL NOT NULL DEFAULT 0,
+                pnl REAL,
+                order_id TEXT NOT NULL DEFAULT '',
+                relayer_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'done',
+                note TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_exit_legs_cycle
+                ON inventory_exit_legs(cycle_id);
+            CREATE INDEX IF NOT EXISTS idx_exit_cycles_wallet_status
+                ON inventory_exit_cycles(wallet, status);
         """
         )
         self.conn.commit()
@@ -315,6 +377,17 @@ class Database:
                 """CREATE UNIQUE INDEX IF NOT EXISTS uq_merge_active_wallet_condition
                 ON merge_operations(wallet COLLATE NOCASE, condition_id COLLATE NOCASE)
                 WHERE status IN ('planned', 'submitted')"""
+            )
+            self.conn.commit()
+        except sqlite3.IntegrityError:
+            self.conn.rollback()
+        # V2: at most one active (non-CLOSED) Inventory Exit cycle per wallet and
+        # condition.  Canonical comparison is NOCASE, matching condition_key().
+        try:
+            c.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_exit_cycle_active_wallet_condition
+                ON inventory_exit_cycles(wallet COLLATE NOCASE, condition_id COLLATE NOCASE)
+                WHERE status != 'CLOSED'"""
             )
             self.conn.commit()
         except sqlite3.IntegrityError:
@@ -1114,6 +1187,287 @@ class Database:
             (order_id, wallet, condition_id, token_id, int(bool(local_eligible)), official_scoring, time.time()),
         )
         self.conn.commit()
+
+    # --- Inventory Exit cycles and legs (V2) ---
+
+    CYCLE_STATUSES = ("ACTIVE", "CLOSING", "BLOCKED", "CLOSED")
+    _EXIT_CYCLE_UPDATE_COLUMNS = {
+        "status", "trigger", "held_side", "held_asset_id", "managed_qty",
+        "initial_qty", "cost_basis", "paired_qty", "direct_recovery",
+        "merge_recovery", "advantage", "selected_route", "maker_window_until",
+        "realized_recovered_collateral", "inventory_pnl", "holding_duration_sec",
+        "closed_reason", "error", "opened_at", "closed_at",
+    }
+
+    def create_exit_cycle(
+        self,
+        wallet,
+        condition_id,
+        trigger="reward_fill",
+        held_side="",
+        held_asset_id="",
+        qty=0.0,
+        opened_at=None,
+        cost_basis=None,
+        paired_qty=0.0,
+    ):
+        """Create one ACTIVE exit cycle, raising ActiveExitCycleExists on duplicates.
+
+        Serializes check+insert with BEGIN IMMEDIATE; the partial unique index
+        ``uq_exit_cycle_active_wallet_condition`` is the cross-process fallback.
+        """
+        c = self.conn.cursor()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute(
+                """SELECT id FROM inventory_exit_cycles
+                WHERE wallet = ? COLLATE NOCASE
+                  AND condition_id = ? COLLATE NOCASE
+                  AND status != 'CLOSED'
+                ORDER BY id LIMIT 1""",
+                (wallet, condition_id),
+            )
+            existing = c.fetchone()
+            if existing:
+                raise ActiveExitCycleExists(wallet, condition_id, int(existing["id"]))
+            now = opened_at if opened_at is not None else time.time()
+            c.execute(
+                """INSERT INTO inventory_exit_cycles
+                (wallet, condition_id, status, trigger, held_side, held_asset_id,
+                 managed_qty, initial_qty, cost_basis, paired_qty, opened_at, updated_at)
+                VALUES (?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    wallet,
+                    condition_id,
+                    trigger,
+                    held_side,
+                    held_asset_id,
+                    float(qty),
+                    float(qty),
+                    cost_basis,
+                    float(paired_qty),
+                    now,
+                    now,
+                ),
+            )
+            self.conn.commit()
+            return c.lastrowid
+        except ActiveExitCycleExists:
+            self.conn.rollback()
+            raise
+        except sqlite3.IntegrityError as exc:
+            self.conn.rollback()
+            raise ActiveExitCycleExists(wallet, condition_id) from exc
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_exit_cycle(self, cycle_id) -> dict | None:
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM inventory_exit_cycles WHERE id = ?", (cycle_id,))
+        row = c.fetchone()
+        return dict(row) if row else None
+
+    def get_active_exit_cycle(self, wallet, condition_id) -> dict | None:
+        """The wallet's non-CLOSED cycle for a condition, or None."""
+        c = self.conn.cursor()
+        c.execute(
+            """SELECT * FROM inventory_exit_cycles
+            WHERE wallet = ? COLLATE NOCASE
+              AND condition_id = ? COLLATE NOCASE
+              AND status != 'CLOSED'
+            ORDER BY id LIMIT 1""",
+            (wallet, condition_id),
+        )
+        row = c.fetchone()
+        return dict(row) if row else None
+
+    def get_non_closed_exit_cycles(self, wallet=None):
+        """Active/CLOSING/BLOCKED cycles (restart recovery + monitor view)."""
+        c = self.conn.cursor()
+        query = "SELECT * FROM inventory_exit_cycles WHERE status != 'CLOSED'"
+        params: list = []
+        if wallet:
+            query += " AND wallet = ? COLLATE NOCASE"
+            params.append(wallet)
+        query += " ORDER BY opened_at, id"
+        c.execute(query, params)
+        return [dict(row) for row in c.fetchall()]
+
+    def get_exit_cycle_condition_keys(self, wallet) -> set:
+        """Distinct condition ids that ever had a cycle (adoption suppression)."""
+        c = self.conn.cursor()
+        c.execute(
+            "SELECT DISTINCT condition_id FROM inventory_exit_cycles "
+            "WHERE wallet = ? COLLATE NOCASE",
+            (wallet,),
+        )
+        return {str(row["condition_id"]) for row in c.fetchall()}
+
+    def update_exit_cycle(self, cycle_id, **fields):
+        """Whitelisted column update; unknown columns are ignored."""
+        allowed = {k: v for k, v in fields.items() if k in self._EXIT_CYCLE_UPDATE_COLUMNS}
+        if not allowed:
+            return
+        allowed["updated_at"] = time.time()
+        sets = ", ".join(f"{k} = ?" for k in allowed)
+        c = self.conn.cursor()
+        c.execute(
+            f"UPDATE inventory_exit_cycles SET {sets} WHERE id = ?",
+            (*allowed.values(), cycle_id),
+        )
+        self.conn.commit()
+
+    def close_exit_cycle(
+        self,
+        cycle_id,
+        closed_reason,
+        realized_recovered_collateral=None,
+        inventory_pnl=None,
+        holding_duration_sec=None,
+        error="",
+    ):
+        """Terminate a cycle as CLOSED with final economic summary."""
+        now = time.time()
+        fields = {"status": "CLOSED", "closed_reason": closed_reason or "", "error": error or ""}
+        if realized_recovered_collateral is not None:
+            fields["realized_recovered_collateral"] = float(realized_recovered_collateral)
+        if inventory_pnl is not None:
+            fields["inventory_pnl"] = float(inventory_pnl)
+        if holding_duration_sec is not None:
+            fields["holding_duration_sec"] = float(holding_duration_sec)
+        fields["closed_at"] = now
+        self.update_exit_cycle(cycle_id, **fields)
+
+    def add_exit_leg(
+        self,
+        cycle_id,
+        wallet,
+        condition_id,
+        kind,
+        asset_id="",
+        side="",
+        qty=0.0,
+        price=0.0,
+        collateral=0.0,
+        pnl=None,
+        order_id="",
+        relayer_id="",
+        status="done",
+        note="",
+        exit_method="",
+        created_at=None,
+    ):
+        c = self.conn.cursor()
+        c.execute(
+            """INSERT INTO inventory_exit_legs
+            (cycle_id, wallet, condition_id, kind, exit_method, asset_id, side,
+             qty, price, collateral, pnl, order_id, relayer_id, status, note, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                cycle_id,
+                wallet,
+                condition_id,
+                kind,
+                exit_method,
+                asset_id,
+                side,
+                float(qty),
+                float(price),
+                float(collateral),
+                pnl,
+                order_id,
+                relayer_id,
+                status,
+                note,
+                created_at if created_at is not None else time.time(),
+            ),
+        )
+        self.conn.commit()
+        return c.lastrowid
+
+    def get_exit_legs(self, cycle_id) -> list[dict]:
+        c = self.conn.cursor()
+        c.execute(
+            "SELECT * FROM inventory_exit_legs WHERE cycle_id = ? ORDER BY created_at, id",
+            (cycle_id,),
+        )
+        return [dict(row) for row in c.fetchall()]
+
+    def get_exit_cycles(
+        self,
+        wallet=None,
+        statuses=None,
+        start=None,
+        end=None,
+        closed_after=None,
+        limit=None,
+        offset=0,
+    ) -> list[dict]:
+        """Cycle list for history/UI. Optional wallet / statuses / time filters."""
+        clause = "WHERE 1=1"
+        params: list = []
+        if wallet:
+            clause += " AND wallet = ? COLLATE NOCASE"
+            params.append(wallet)
+        if statuses:
+            placeholders = ",".join("?" * len(statuses))
+            clause += f" AND status IN ({placeholders})"
+            params.extend(statuses)
+        if start:
+            clause += " AND opened_at >= ?"
+            params.append(start)
+        if end:
+            clause += " AND opened_at <= ?"
+            params.append(end)
+        if closed_after:
+            clause += " AND closed_at >= ?"
+            params.append(closed_after)
+        query = f"SELECT * FROM inventory_exit_cycles {clause} ORDER BY opened_at DESC, id DESC"
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params += [int(limit), int(offset)]
+        c = self.conn.cursor()
+        c.execute(query, params)
+        return [dict(row) for row in c.fetchall()]
+
+    def get_exit_legs_since(self, since: float, wallet=None) -> list[dict]:
+        """Legs created at/after ``since`` across the ledger (dashboard)."""
+        c = self.conn.cursor()
+        if wallet:
+            c.execute(
+                """SELECT * FROM inventory_exit_legs
+                WHERE created_at >= ? AND wallet = ? COLLATE NOCASE
+                ORDER BY created_at, id""",
+                (since, wallet),
+            )
+        else:
+            c.execute(
+                """SELECT * FROM inventory_exit_legs
+                WHERE created_at >= ? ORDER BY created_at, id""",
+                (since,),
+            )
+        return [dict(row) for row in c.fetchall()]
+
+    def count_exit_cycles(self, wallet=None, statuses=None, start=None, end=None) -> int:
+        clause = "WHERE 1=1"
+        params: list = []
+        if wallet:
+            clause += " AND wallet = ? COLLATE NOCASE"
+            params.append(wallet)
+        if statuses:
+            placeholders = ",".join("?" * len(statuses))
+            clause += f" AND status IN ({placeholders})"
+            params.extend(statuses)
+        if start:
+            clause += " AND opened_at >= ?"
+            params.append(start)
+        if end:
+            clause += " AND opened_at <= ?"
+            params.append(end)
+        c = self.conn.cursor()
+        c.execute(f"SELECT COUNT(*) FROM inventory_exit_cycles {clause}", params)
+        return int(c.fetchone()[0])
 
     # --- Eligible Markets ---
 

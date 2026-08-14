@@ -92,9 +92,24 @@ TEMPLATE_DEFAULTS = {
     # Merge-first V1: only ordinary same-condition binary complete sets.
     "merge_enabled": True,
     "merge_min_shares": 1.0,
-    # A positive edge prevents routing an emergency exit through a complement
-    # purchase on a merely theoretical improvement.
+    # V2 meaning (clarified): FOK+Merge must recover at least this much more
+    # collateral than direct exit to be selected.  Default 0.01 USD.  A
+    # positive edge prevents routing an exit through a complement purchase on
+    # a merely theoretical improvement.
     "merge_advantage_min_usd": 0.01,
+    # V2 master switch: when true the Inventory Exit Engine owns post-fill
+    # inventory; when false the legacy post-fill exit behavior runs
+    # (compatibility/testing only).  Never allow both engines to mutate the
+    # same condition simultaneously.
+    "fast_exit_enabled": True,
+    # Bounded maker escape window (seconds) for one-sided residual that does
+    # not immediately justify FOK+Merge.  0 = do not wait; immediately choose
+    # protected direct exit or FOK+Merge.
+    "maker_exit_wait_sec": 30,
+    # Type3 / POLY_1271 safety gate: when fast_exit_enabled + merge_enabled +
+    # this flag are all true and the wallet's automatic-Merge runtime
+    # capability is not READY, do NOT place new Reward BUY orders.
+    "require_merge_ready_for_new_buys": True,
     # 档位模块:按市场最低奖励份额(rewards_min_size)精确匹配的挂单参数组,取代了
     # 原先的奖励最低份额范围筛选、选档系数门槛与金额数值表(均已下沉到每个档位内)。
     # 每项 {size, enabled, shares, rule1/2/3_min_coeff, gap_high_coeff_sum_min,

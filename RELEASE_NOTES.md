@@ -1,6 +1,63 @@
 > **当前更新方式：** 以下各版本条目是历史发布记录。运行中的应用已经移除
 > GitHub 检查与自动安装/回滚功能；版本更新只能由管理员显式部署并验证。
 
+## v8.5.0 · Merge-First Fast-Exit V2：成交后库存快速退出
+
+**行为变化：Reward BUY 成交即进入库存退出周期。** 奖励单是为了赚流动性奖励，
+成交后的持仓不再当作方向性投资，而是尽快转回抵押品：完整集合先 Merge，单侧残差
+在「受保护直卖 / FOK 补对侧 + Merge / 短时 Maker 逃生」三条路线中选择，杜绝
+「填 → 亏 → 再买 → 再亏」的反复损耗。
+
+### 新参数（全部走模板，Web 配置齐全）
+
+- `fast_exit_enabled`（默认 true）：「启用成交后快速库存退出」主开关；关闭后回退
+  旧的成交后离场行为（兼容/测试用），两个引擎不会同时改同一条件。
+- `maker_exit_wait_sec`（默认 30，最小 0）：「Maker 快速退出等待」；0=不等待，立即选
+  受保护直卖或 FOK+Merge。窗口内挂 Maker 卖单（可低于成本，绝不穿价）、对侧 Reward
+  BUY 限量补成完整集合。
+- `require_merge_ready_for_new_buys`（默认 true）：「Merge 未就绪时暂停新开仓」；
+  Type3 + 开启自动 Merge 时，Merge 运行时能力未就绪（Relayer 未配置/验证失败/
+  存款地址不符/交易禁用等）→ 暂停挂新 Reward BUY，扫描/监控/既有库存退出/既有撤单照常。
+- `merge_advantage_min_usd`（沿用 V1 键，语义澄清）：FOK+Merge 必须比受保护直卖至少
+  多回收这么多才采用（默认 0.01 USD）；**成交后立即比较，不必等严重亏损**。
+- 止损键（`stop_loss_mode/stop_loss_percent/theta_stop_cents`）保留，产品语义改为
+  「紧急退出阈值」：达到阈值后不是无脑市价卖，而是跳过 Maker 等待、立即比较
+  Market 与 FOK+Merge 两条受保护路线。
+
+### 核心规则
+
+- **同侧禁买（Rule #1）**：周期内持有残差的 token 不再挂 Reward BUY（防 churn）；
+  周期关闭不绕过原有冷却。
+- **对侧限量**：对侧 Reward BUY 有效量 = 未配对残差 − 在挂对侧买单，绝不超买。
+- **完整集合 Merge-first（Rule #2）**：已确认 YES+NO 先 Merge，低余额/结算/止损
+  都不拆散配对。
+- **直卖用可执行深度计价**：深度加权回收 + 最差价上界（FAK 市价限价卖），不是
+  无脑 best_bid×qty、不是无保护的市价卖。
+- **FOK+Merge 竞态防护**：先撤对侧 Reward BUY 与冲突 SELL → 确认撤单 → 重取持仓
+  → 重取补边盘口 → 用新鲜残差与限价 → 才提交精确 FOK；撤单未确认不 FOK。
+- **FOK/Merge 结果不确定 → BLOCKED 等待，绝不假设失败就市价卖**。
+
+### 新账本与界面
+
+- `inventory_exit_cycles` + `inventory_exit_legs`：每个成交一个持久退出周期
+  （ACTIVE/CLOSING/BLOCKED/CLOSED），每钱包每条件唯一（SQLite 部分唯一索引）；
+  重启后从 DB + CLOB + Data API 恢复。
+- 监控页「库存退出」视图：残差/成本/库存龄/配对量/Market 与 Merge 预计回收/优势/
+  Maker 剩余/路线/周期状态/阻断原因。
+- 历史页「库存退出周期」：退出方式 MERGE / FOK+MERGE / MAKER / MARKET / MIXED，
+  可展开查看买入/补边/Merge/卖出各腿。
+- 仪表盘「今日真实净结果」：权威 daily_pnl 的 Rewards + 库存已实现 PnL = 净收益；
+  按退出方式拆 PnL；运营指标（成交数/退出周期数/Merge 与 Market 占比/平均持仓/
+  最老未平库存）；每市场经济学（奖励无市场级权威数据时显示 --，不填 0、不估）。
+- 钱包列表新增 Fast Exit（READY/仅 Maker-Market/BLOCKED）与新开仓（允许/暂停·原因）。
+
+### 兼容与安全
+
+- `fast_exit_enabled=false` 时旧离场/低余额逻辑完整保留；V2 经充分验证前不删除旧代码。
+- 扫描/奖励/档位/排序/Post-Only 买/多钱包/代理/加密/Type3 校验/Relayer 凭据/
+  Merge 账本/FIFO/CLOB 认证/结算守卫全部冻结未动。
+- 全程无实盘验证（本任务只到 READY_FOR_INDEPENDENT_AUDIT）。
+
 ## v8.4.0 · Merge / Relayer 授权：Web 配置一次，加密存储，之后自动加载
 
 **行为变化：自动 Merge 不再要求 SSH 手工配置环境变量。** Type3 钱包现在可以在

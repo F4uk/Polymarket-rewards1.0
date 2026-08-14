@@ -3,7 +3,7 @@
 > 本地单用户的 Polymarket 自动做市工具，通过挂单赚取流动性奖励（liquidity rewards）。
 > A local, single-user app that automates reward-farming market making on Polymarket.
 
-![version](https://img.shields.io/badge/version-8.2.0-blue)
+![version](https://img.shields.io/badge/version-8.5.0-blue)
 ![python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![flask](https://img.shields.io/badge/flask-3.1-black)
 ![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)
@@ -48,6 +48,19 @@ Built for **non-technical users**: install, double-click, a browser opens, you s
 - **每钱包独立策略模板**：多模板增删改，每个钱包绑定自己的参数模板（阈值 / 敞口 / 离场 / 档位模块各自可调）。
 - **单侧成交暂停**：成交后只暂停已成交 token/side 的新 BUY，对侧奖励 BUY 继续维护；普通单边仓可同时等待对侧 reward BUY 与本侧 maker SELL，哪条路径先成交就先处理。
 - **持仓驱动的两段式离场**：成本价由真实 CLOB 成交逐笔重建（FIFO 净额，绝不用 Data API avgPrice），每个持仓**始终只挂一张**卖单，且**永不低于成本卖出**。成本 ≤ 买一（浮盈）挂卖一做 maker 吃价差；成本 > 买一（保本 / 套牢）挂成本价等回本。认亏出口包括强平兜底（亏损达到止损线——按比例默认成本 20%，或按固定美分——市价清仓），以及严重亏损时在 direct SELL 与受保护 FOK 补对侧 + Merge 之间选择少亏路线。成本无法可靠重建时**跳过并显著告警**（⚠️裸奔，绝不按不确定成本卖出，自愈式重试）。
+- **成交后快速库存退出（Fast-Exit V2，默认开启）**：Reward BUY 成交即进入
+  `(钱包, 市场)` 库存退出周期。完整集合**先 Merge**；单侧残差立即比较
+  **受保护直卖**（可执行深度计价 + 最差价上界 FAK）与 **FOK 补对侧 + Merge**
+  （按签名 FOK 最差限价计价，优势 ≥ `merge_advantage_min_usd` 即立刻执行，不必等
+  严重亏损）。否则进入有上限的 **Maker 逃生窗口**（`maker_exit_wait_sec`，默认 30 秒；
+  挂单可低于成本、绝不穿价），超时后走受保护直卖。紧急退出阈值 / 低余额 / 结算到达时
+  **跳过等待**，但仍只走受保护路线，不做无脑市价卖。同侧持仓未退出前**禁止重挂**
+  该 token 的 Reward BUY（防填-亏-再买 churn）；对侧 Reward BUY 限量到未配对残差。
+  Type3 + 开启自动 Merge 时，Merge 运行时未就绪会**暂停新开仓**
+  （`require_merge_ready_for_new_buys`，默认开）。每次退出都持久记账为
+  **MERGE / FOK+MERGE / MAKER / MARKET / MIXED**，历史可逐腿展开审计。
+- **今日真实净结果**：仪表盘直接给出「今日 Rewards（权威 daily_pnl）＋ 今日库存已实现
+  PnL ＝ 今日净收益」，并按退出方式拆分；奖励未记账时显示「待记账」而非假装 0。
 - **账户净值曲线**：引擎运行期间每个钱包每天记一次净值（现金 + 持仓市值），「资产曲线」页看历史走势，也可查任意某天的净值。
 - **全局黑名单**：在下单 / 扫描 / 监控三处统一拦截不想参与的市场。
 - **私钥本地加密**：钱包私钥用 AES-256-GCM 加密，密钥由你的密码经 PBKDF2（60 万次迭代）派生，仅存在于内存。
@@ -55,6 +68,57 @@ Built for **non-technical users**: install, double-click, a browser opens, you s
 - **Merge / Relayer 授权（Web 配置，加密存储）**：Builder API Key / Secret / Passphrase 在「配置」页配置一次，用登录密码派生的密钥 AES 加密后存库（`relayer_credentials` 表，绝不明文落库），之后登录自动解密使用；普通用户无需填写 Relayer URL（默认官方 `https://relayer-v2.polymarket.com/`）。「保存并测试 / 重新测试」只做只读验证（派生 Deposit Wallet、比对存款地址、认证读 nonce、确认交易可用），不会部署钱包、不提交 Merge、不下单。服务器部署仍可用 `PMM_BUILDER_API_KEY / PMM_BUILDER_SECRET / PMM_BUILDER_PASSPHRASE / PMM_POLYGON_RPC_URL` 环境变量，UI 加密配置优先、ENV 回退，二者互不覆盖。
 
 > Gap-tier single-rung placement with per-tier modules keyed by the market's minimum reward size (each module carries its own share count and gating thresholds — a market whose minimum size matches no enabled module is never placed), per-wallet strategy templates, Merge-first handling for ordinary binary Type3 positions, position-driven exit that never sells below a cost reconstructed from real fills, a daily net-worth history per wallet, a global blacklist enforced at three choke points, and AES-256-GCM encrypted keys held only in memory.
+
+### Fast-Exit V2（成交后库存快速退出）
+
+中文：
+
+- **产品模型**：Reward BUY 是为了赚奖励，不是方向性投资。成交 = 库存风险事件 → 进入
+  退出周期，尽快转回抵押品。
+- **Merge-first**：已确认 YES+NO 完整集合永远先 Merge（NegRisk/多结果市场不 Merge），
+  低余额、结算、紧急阈值都不拆散配对。
+- **残差三条路线**（每次都先算两条回收再决定）：
+  1. **受保护直卖**：按买单簿可执行深度计算回收，以「吃满数量所需的最差价位」为限价
+     下 FAK 市价限价卖单——"市价退出"不等于无保护滑点。
+  2. **FOK 补对侧 + Merge**：回收 = 数量×1 − 签名 FOK 最差限价×数量 − 费用缓冲；
+     只有当它比受保护直卖至少多回收 `merge_advantage_min_usd`（默认 0.01 USD）才选。
+     成交后立刻判断，不用等严重亏损。
+  3. **Maker 逃生窗口**：默认最多 30 秒（`maker_exit_wait_sec`，0=不等待）。窗口内
+     本侧挂 Maker 卖单（价格跟随当前 ask/bid/tick，**可低于成本**、绝不穿价变 taker），
+     对侧 Reward POST-ONLY BUY 可继续、但**限量到未配对残差**；窗口超时后回到前两条
+     受保护路线。
+- **紧急退出阈值**（沿用 V1 的 `stop_loss_*` 键，语义升级）：达到阈值 → **跳过**
+  Maker 等待 → 立即比较 Market 与 FOK+Merge → 走可执行的最优受保护路线；两条都不可
+  执行时 BLOCKED 重试，绝不发明执行。
+- **churn 防护**：同侧持仓未退出 → 该 token 的 Reward BUY 被硬禁；周期关闭后原有
+  冷却照常生效。对侧买单：在挂 + 新增 ≤ 未配对残差。
+- **Merge 就绪闸门**：Type3 且 `fast_exit_enabled + merge_enabled +
+  require_merge_ready_for_new_buys` 全开时，Merge 运行时能力（Relayer 配置/验证/
+  存款地址/交易可用性，短缓存）未 READY → 不挂新 Reward BUY；扫描、监控、既有库存
+  退出、既有撤单照常。
+- **竞态与不确定**：FOK 前先撤对侧 BUY 与冲突 SELL 并确认撤单；FOK/Relayer 结果
+  不确定 → 周期 BLOCKED/CLOSING，绝不"当失败然后市价卖"。一个 (钱包, 市场) 同时只有
+  一个活跃周期（SQLite 部分唯一索引，重启可恢复）。
+- **界面**：监控页新增「库存退出」视图（预计回收/优势/Maker 剩余/路线/状态）；历史页
+  新增「库存退出周期」（退出方式 MERGE / FOK+MERGE / MAKER / MARKET / MIXED，可展开
+  腿）；仪表盘新增「今日真实净结果」与每市场经济学（奖励无市场级权威数据时显示 --，
+  不填 0、不估）；钱包列表新增 Fast Exit / 新开仓状态列。
+- 关闭 `fast_exit_enabled` 即回退 V1 成交后离场行为（兼容/测试），两引擎不会同时
+  改同一条件。旧代码保留到 V2 充分验证后另行清理。
+
+English: Reward BUY fills are inventory-risk events. A durable exit cycle
+(wallet, condition) starts on fill: complete sets Merge first; one-sided
+residual immediately compares depth-protected direct exit (FAK marketable limit
+at the worst price consumed by the required depth) vs FOK-complement+Merge
+(worst-case signed limit; must beat direct by `merge_advantage_min_usd`, default
+0.01 USD), else a bounded maker escape window (`maker_exit_wait_sec`, default 30;
+below-cost resting allowed, never crossing) before the protected direct exit.
+Emergency threshold / low balance / resolution skip the wait but still use only
+protected routes. Same-token Reward BUYs are blocked while residual exists;
+opposite-side BUYs are capped to the unpaired residual; a Type3 Merge-readiness
+gate can pause new openings. Every exit is auditable as MERGE / FOK+MERGE /
+MAKER / MARKET / MIXED; the dashboard shows Rewards + realized inventory PnL as
+the true net result.
 
 ---
 

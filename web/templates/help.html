@@ -37,6 +37,39 @@
 </section>
 
 <section class="config-section">
+    <h2>成交后库存处理（Fast-Exit V2）</h2>
+    <ul>
+        <li><b>Reward BUY 是为了赚做市奖励</b>：成交后的持仓不是方向性投资，程序会立即
+            开启「库存退出周期」，尽快把库存转回抵押品。</li>
+        <li><b>完整集合先 Merge</b>：普通二元市场的 YES+NO 配对永远优先合并；
+            低余额、结算、紧急退出都不会拆散配对。</li>
+        <li><b>单侧残差三条路线</b>（每次都先算两条回收再决定）：
+            ① 受保护直卖——按买单簿可执行深度计价，以吃满数量所需的最差价位为限价下
+            FAK 市价限价卖单，绝不无保护滑点；
+            ② FOK 补对侧 + Merge——回收按签名 FOK 的最差限价计算，只有比受保护直卖
+            至少多回收「补边 Merge 最低优势」（默认 0.01 USD）才选，成交后立即判断，
+            不必等严重亏损；
+            ③ Maker 逃生窗口——默认最多 30 秒，窗口内本侧挂 Maker 卖单（可低于成本、
+            绝不穿价），对侧 Reward BUY 限量到未配对残差，超时后回到受保护直卖。</li>
+        <li><b>紧急退出阈值</b>（原止损项）：达到阈值后<b>不是无脑市价卖</b>，而是跳过
+            Maker 等待、立即比较受保护 Market 与 FOK+Merge，走可执行的最优保护路线；
+            两条都不可执行时 BLOCKED 重试。</li>
+        <li><b>防反复损耗</b>：同侧持仓未退出 → 该 token 禁止重挂 Reward BUY；
+            周期关闭后原有冷却照常生效。对侧买单：在挂 + 新增 ≤ 未配对残差。</li>
+        <li><b>Merge 未就绪时暂停新开仓</b>：Type3 且开启自动 Merge 时，Merge 运行时
+            能力未就绪（Relayer 未配置/验证失败/存款地址不符/交易禁用等）→ 不挂新的
+            Reward BUY；扫描、监控、既有库存退出、既有撤单照常。Type1/Type2 不受影响，
+            Fast Exit 仍可用 Maker/Market 路径。</li>
+        <li><b>结果不确定时绝不当失败处理</b>：FOK/Relayer 结果未知 → 周期 BLOCKED/
+            CLOSING，等对账，绝不「假设失败然后市价卖」。</li>
+        <li>每次退出都持久记账，退出方式为 <b>MERGE / FOK+MERGE / MAKER / MARKET /
+            MIXED</b>；历史页「库存退出周期」可展开逐腿查看；仪表盘给出「今日 Rewards
+            ＋ 今日库存已实现 PnL ＝ 今日净收益」（奖励未记账时显示待记账，不填 0）。</li>
+        <li>关闭「启用成交后快速库存退出」即回退 V1 成交后离场行为（兼容/测试用）。</li>
+    </ul>
+</section>
+
+<section class="config-section">
     <h2>Merge / Relayer 授权</h2>
     <ul>
         <li><b>首次配置一次，之后自动加载。</b>在「配置」页的「Merge / Relayer 授权」里填一次
@@ -63,7 +96,7 @@
     <ul>
         <li><b>启用自动 Merge</b>：默认开启；取消勾选后只关闭该模板的自动 Merge，不影响 Type1/Type2 或 Type3 的常规做市。</li>
         <li><b>最小 Merge 份数</b>：默认 1；配对数量小于它时不提交 Merge。</li>
-        <li><b>紧急补全优势下限</b>：默认 0.01 USD；只有“FOK 补对侧 + Merge”比直接卖至少多保住这么多价值，才选择补全。</li>
+        <li><b>补边 Merge 最低优势</b>：默认 0.01 USD；只有“FOK 补对侧 + Merge”比受保护直卖至少多回收这么多价值，才选择补全（成交后立即判断，不必等严重亏损）。</li>
         <li><b>低余额触发线</b>（<code>low_balance_threshold_usd</code>）：默认 0，即关闭自动低余额清仓。</li>
     </ul>
 </section>

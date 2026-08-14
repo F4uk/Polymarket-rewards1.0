@@ -124,8 +124,10 @@ class TestEngineLifecycle:
 
 class TestWalletWorkerTick:
     def test_tick_runs_check_exit_between_fills_and_compliance(self):
+        api, db = MagicMock(), MagicMock()
+        db.get_template_for.return_value = {"fast_exit_enabled": False}
         worker = WalletWorker(
-            MagicMock(), MagicMock(), "0xABC", {"fill_check_interval_sec": 5}
+            api, db, "0xABC", {"fill_check_interval_sec": 5}
         )
         worker.monitor = MagicMock()
 
@@ -978,7 +980,10 @@ class TestTickSharesOpenOrders:
         api.gamma_resolution_status.return_value = {}
         api.get_balance.return_value = 100.0
         db.get_settings.return_value = {"rewards_cache_ttl_sec": 0}
-        db.get_template_for.return_value = {"low_balance_threshold_usd": 0}
+        db.get_template_for.return_value = {
+            "low_balance_threshold_usd": 0,
+            "fast_exit_enabled": False,
+        }
         db.get_blacklist_ids.return_value = set()
         worker = WalletWorker(api, db, "0xW", {"fill_check_interval_sec": 5})
         # 不让台账重算线程掺进来:_maybe_rebuild_pnl 只在 _last_pnl_date == 今天(beijing_day)

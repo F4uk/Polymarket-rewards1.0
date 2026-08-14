@@ -25,6 +25,7 @@ from engine import monitor_status
 from engine.merge import ordinary_binary_plan
 from engine.positions import condition_key, positions_by_condition
 from engine.take_profit import consume_fifo_lots
+from engine.inventory_exit import InventoryExitEngine
 from api.ctf import RelayerUnavailable, Type3MergeClient
 from api.polymarket_api import OrderRejected
 from api.proxy import parallel_map
@@ -111,6 +112,49 @@ class OrderMonitor:
         # FOK. Keep that narrow condition out of a direct B0 exit until the
         # persisted planned merge is reconciled (or its short grace expires).
         self._pending_fok_until: dict[str, float] = {}
+        # V2 post-fill inventory engine (lazy, one per monitor).
+        self._exit_engine: InventoryExitEngine | None = None
+
+    def _fast_exit_enabled(self) -> bool:
+        try:
+            return bool(
+                self.db.get_template_for(self.wallet_address).get(
+                    "fast_exit_enabled", True
+                )
+            )
+        except Exception:
+            return False
+
+    def exit_engine(self) -> InventoryExitEngine | None:
+        """Public accessor so placement (manager) shares the same engine."""
+        try:
+            return self._inventory_exit()
+        except Exception:
+            return None
+
+    def _inventory_exit(self) -> InventoryExitEngine:
+        if self._exit_engine is None:
+            self._exit_engine = InventoryExitEngine(
+                self.api,
+                self.db,
+                self.wallet_address,
+                encryption_key=self.encryption_key,
+                condition_lock=self._condition_lock,
+                cost_provider=self._cost_lots,
+                book_provider=self._engine_book,
+                status_add=self._status_add,
+                record_action=self._record_action,
+            )
+        return self._exit_engine
+
+    def _engine_book(self, asset_id: str):
+        """Orderbook for the exit engine: per-tick prefetch cache first."""
+        if asset_id in self._book_cache:
+            return self._book_cache[asset_id]
+        try:
+            return self.api.get_orderbook(asset_id)
+        except Exception:
+            return None
 
     def begin_status_tick(self) -> None:
         self._status_rows = []
@@ -382,6 +426,48 @@ class OrderMonitor:
             action="成交→撤余单",
             detail=f"成交{size}，止盈由持仓维护",
         )
+        if self._fast_exit_enabled():
+            try:
+                self._inventory_exit().on_reward_fill(ev)
+            except Exception as e:
+                logger.error("inventory exit cycle create/join failed %s: %s", market_id, e)
+
+    def check_inventory_exit(self, open_orders=None):
+        """V2 Inventory Exit Engine pass (runs after check_merges).
+
+        In V2 mode this step owns all post-fill inventory: complete sets are
+        Merge-first (check_merges), one-sided residual gets the immediate
+        FOK+Merge / bounded maker window / protected direct route decision.
+        """
+        if not self._fast_exit_enabled():
+            return
+        if open_orders is None:
+            try:
+                open_orders = self.api.get_open_orders()
+            except Exception as e:
+                logger.error(
+                    "get_open_orders failed (skip inventory exit): %s", e
+                )
+                return
+        try:
+            positions = self.api.get_user_positions(self._funder())
+        except Exception as e:
+            logger.warning("Data API positions failed (skip inventory exit): %s", e)
+            return
+        try:
+            self._exit_prefetch(
+                [
+                    p
+                    for p in positions
+                    if float(p.get("size", 0) or 0) > 0
+                ]
+            )
+        except Exception as e:
+            logger.warning("[库存退出] 预取失败(退回逐仓自取): %s", e)
+        try:
+            self._inventory_exit().run_tick(open_orders=open_orders, positions=positions)
+        except Exception as e:
+            logger.exception("inventory exit tick crashed: %s", e)
 
     def _merge_client(self):
         if int(getattr(self.api, "signature_type", -1)) != 3:

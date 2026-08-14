@@ -158,6 +158,8 @@ class WalletWorker:
 
         self._maybe_rebuild_pnl()
         self.monitor.begin_status_tick()
+        tmpl = self.db.get_template_for(self.wallet_address)
+        fast_exit = bool(tmpl.get("fast_exit_enabled", True))
         try:
             open_orders = self.api.get_open_orders()
         except Exception as e:
@@ -167,8 +169,16 @@ class WalletWorker:
             _step("成交", self.monitor.check_buy_orders)
             _step("结算", self.monitor.check_resolution, open_orders)
             _step("合并", self.monitor.check_merges, self._condition_lock)
-            _step("低余额", self.monitor.check_low_balance, open_orders)
-            _step("离场", self.monitor.check_exit, open_orders)
+            if fast_exit:
+                # V2: the Inventory Exit Engine owns post-fill inventory
+                # (complete sets Merge-first, residual routes, low-balance /
+                # resolution / emergency semantics).  Legacy check_exit /
+                # check_low_balance must NOT run in the same tick — two
+                # engines would mutate the same condition.
+                _step("库存退出", self.monitor.check_inventory_exit, open_orders)
+            else:
+                _step("低余额", self.monitor.check_low_balance, open_orders)
+                _step("离场", self.monitor.check_exit, open_orders)
             _step("合规", self.monitor.check_sell_orders)
             self.monitor.publish_status()
         finally:
@@ -265,6 +275,20 @@ class WalletWorker:
         held_assets, held_value, held_shares = held_side_info(positions)
         blacklist = self.db.get_blacklist_ids()
         tmpl = self.db.get_template_for(self.wallet_address)
+        # V2 Merge 就绪闸门:Type3 + 模板要求 fast_exit/merge/require_merge_ready
+        # 时,自动 Merge 运行时不 READY -> 本钱包本轮不挂任何新 Reward BUY
+        # (扫描/监控/既有库存退出/既有撤单照常)。Type1/Type2 与闸门关闭的模板
+        # 快速通过,不发网络探测。
+        exit_engine = self.monitor.exit_engine()
+        if exit_engine is not None:
+            merge_ready, merge_reason = exit_engine.merge_runtime_ready()
+            if not merge_ready:
+                logger.info(
+                    "[exit-v2] Merge 未就绪(%s)：暂停 %s 新开仓",
+                    merge_reason,
+                    self.wallet_address[:8],
+                )
+                return
         size_tiers = tmpl.get("size_tiers") or []
         gap_wide_cents = float(tmpl.get("gap_wide_cents", 10))
         gap_mid_cents = float(tmpl.get("gap_mid_cents", 5))
@@ -497,7 +521,30 @@ class WalletWorker:
                     continue
                 token_id = side["token_id"]
                 resting = buys_by_token.get(token_id, [])
-                if token_id in held_assets or self.db.is_side_paused(
+                authority = None
+                if exit_engine is not None:
+                    try:
+                        proposed = sum(
+                            float(s) for _p, s in ladders.get(key, [])
+                        ) or 0
+                        authority = exit_engine.authorize_placement(
+                            mid, token_id, side.get("outcome", ""),
+                            proposed, open_orders,
+                        )
+                    except Exception as ex:
+                        logger.warning(
+                            "placement authority failed for %s/%s: %s",
+                            mid, token_id, ex,
+                        )
+                if authority is not None and authority.get("kind") == "same_token_block":
+                    # Rule #1: 同侧持仓未退出 -> 撤光该侧在挂买单、不挂新单。
+                    cancel_ids, to_place = reconcile_buy_orders([], resting)
+                    cancel_reason = "库存退出中·同侧禁买:" + authority["reason"]
+                    cancel_action = "exit_inventory_cancel"
+                elif authority is not None and authority.get("kind") == "opposite_cap":
+                    # 对侧已达残差上限:保留在挂买单(可成交补成完整集合),不挂新单。
+                    continue
+                elif token_id in held_assets or self.db.is_side_paused(
                     self.wallet_address, mid, token_id
                 ) is True:
                     # 成交后单侧暂停:撤光该侧全部在挂买单、不挂新单(SP5b Q1)
@@ -505,6 +552,22 @@ class WalletWorker:
                     cancel_reason = "成交后单侧暂停:撤掉该侧全部买单,直至该侧持仓平掉"
                     cancel_action = "side_pause_cancel"
                 elif budget_ok:
+                    if (
+                        authority is not None
+                        and authority.get("effective_qty") is not None
+                    ):
+                        # 对侧 Reward BUY 上限:clamp 到残差,保持累计不超。
+                        cap = float(authority["effective_qty"])
+                        capped = []
+                        remaining = cap
+                        for price, shares in ladders.get(key, []):
+                            take = min(float(shares), remaining)
+                            if take > 0:
+                                capped.append((price, take))
+                            remaining -= take
+                            if remaining <= 0:
+                                break
+                        ladders[key] = capped
                     cancel_ids, to_place = reconcile_buy_orders(
                         ladders.get(key, []), resting
                     )

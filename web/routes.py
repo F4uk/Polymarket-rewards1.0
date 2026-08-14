@@ -38,21 +38,28 @@ logger = logging.getLogger(__name__)
 
 _MERGE_NUMERIC_RULES = {
     "merge_min_shares": "最小 Merge 份数",
-    "merge_advantage_min_usd": "紧急补全优势下限",
+    "merge_advantage_min_usd": "补边 Merge 最低优势",
+    "maker_exit_wait_sec": "Maker 快速退出等待",
+}
+
+_FAST_EXIT_BOOL_KEYS = {
+    "fast_exit_enabled": "启用成交后快速库存退出",
+    "require_merge_ready_for_new_buys": "Merge 未就绪时暂停新开仓",
 }
 
 
 def _validate_merge_template_values(strategy: dict):
-    """Reject missing/non-finite/negative Merge controls before persistence.
+    """Reject missing/non-finite/negative Merge + Fast-Exit V2 controls.
 
     These values select whether a funds-moving route is eligible.  Accepting
     JSON ``null`` (the browser representation of NaN) and later coercing it to
     zero would silently weaken the saved strategy, so both template-writing
     endpoints share this fail-closed check.
     """
-    if "merge_enabled" in strategy and not isinstance(
-        strategy["merge_enabled"], bool
-    ):
+    for key, label in _FAST_EXIT_BOOL_KEYS.items():
+        if key in strategy and not isinstance(strategy[key], bool):
+            return f"{label}必须是布尔值"
+    if "merge_enabled" in strategy and not isinstance(strategy["merge_enabled"], bool):
         return "启用自动 Merge 必须是布尔值"
     for key, label in _MERGE_NUMERIC_RULES.items():
         if key not in strategy:
@@ -414,6 +421,56 @@ def api_monitor_status():
     return jsonify(snap)
 
 
+# --- API: Inventory Exit (V2) ---
+
+
+@app.route("/api/inventory-exit", methods=["GET"])
+@login_required
+def api_inventory_exit():
+    """Active exit cycles for the monitor page (non-CLOSED only)."""
+    from engine.inventory_exit import exit_method_label
+
+    wallet = request.args.get("wallet") or None
+    cycles = db.get_non_closed_exit_cycles(wallet)
+    for cycle in cycles:
+        cycle["legs"] = db.get_exit_legs(cycle["id"])
+        cycle["method"] = exit_method_label(cycle["legs"])
+    _enrich_rows(cycles, "condition_id")
+    return jsonify({"cycles": cycles, "updated": time.time()})
+
+
+@app.route("/api/exit-cycles", methods=["GET"])
+@login_required
+def api_exit_cycles():
+    """Closed/active cycle history with legs (History page)."""
+    from engine.inventory_exit import exit_method_label
+
+    wallet = request.args.get("wallet") or None
+    status = request.args.get("status") or None
+    statuses = [s.strip() for s in status.split(",")] if status else None
+    start = request.args.get("start", type=float)
+    end = request.args.get("end", type=float)
+    page = max(1, request.args.get("page", default=1, type=int) or 1)
+    page_size = request.args.get("page_size", default=50, type=int) or 50
+    page_size = min(200, max(1, page_size))
+    total = db.count_exit_cycles(wallet, statuses, start, end)
+    cycles = db.get_exit_cycles(
+        wallet,
+        statuses,
+        start,
+        end,
+        limit=page_size,
+        offset=(page - 1) * page_size,
+    )
+    for cycle in cycles:
+        cycle["legs"] = db.get_exit_legs(cycle["id"])
+        cycle["method"] = exit_method_label(cycle["legs"])
+    _enrich_rows(cycles, "condition_id")
+    return jsonify(
+        {"cycles": cycles, "total": total, "page": page, "page_size": page_size}
+    )
+
+
 # --- API: Settings ---
 
 
@@ -602,6 +659,42 @@ def api_list_wallets():
             w, template, relayer_configured_flag, test_results.get(w["address"])
         )
         w.update(merge)
+        # V2 display contract: Trading / Merge / Fast Exit / 新开仓.
+        sig3 = int(w.get("signature_type", -1)) == 3
+        fast_exit_enabled = bool(template.get("fast_exit_enabled", True))
+        merge_enabled = bool(template.get("merge_enabled", True))
+        require_gate = bool(template.get("require_merge_ready_for_new_buys", True))
+        merge_ready = merge["merge_status"] == "ready"
+        trading_blocked = w.get("trading_enabled") is False
+        if not fast_exit_enabled:
+            fast_exit_status = "disabled"
+        elif trading_blocked:
+            fast_exit_status = "blocked"
+        elif sig3 and merge_enabled and not merge_ready:
+            fast_exit_status = "degraded"
+        else:
+            fast_exit_status = "ready"
+        new_opening = "allowed"
+        new_opening_reason = ""
+        if trading_blocked:
+            new_opening = "paused"
+            new_opening_reason = "CLOB 交易被禁用"
+        elif (
+            sig3
+            and fast_exit_enabled
+            and merge_enabled
+            and require_gate
+            and not merge_ready
+        ):
+            new_opening = "paused"
+            new_opening_reason = (
+                "Merge 未就绪 · "
+                + (merge.get("merge_reason_cn") or merge.get("merge_reason") or "")
+            )
+        w["fast_exit_enabled"] = fast_exit_enabled
+        w["fast_exit_status"] = fast_exit_status
+        w["new_opening_allowed"] = new_opening
+        w["new_opening_reason"] = new_opening_reason
     return jsonify(wallets)
 
 
@@ -1666,6 +1759,118 @@ def api_dashboard():
     except Exception:
         templates_without_tiers = []
 
+    # --- V2 真实净结果（权威 daily_pnl 台账 + 库存退出账本）---
+    from datetime import datetime, timedelta, timezone
+    from engine.inventory_exit import EXIT_METHODS, exit_method_label
+    from engine.pnl import beijing_day
+
+    today = beijing_day(time.time())
+    day_start = datetime.fromisoformat(f"{today}T00:00:00+08:00").timestamp()
+    daily_all = db.get_daily_pnl_all(today, today)
+    rewards_today = round(
+        sum(float(d.get("reward", 0) or 0) + float(d.get("rebate", 0) or 0) for d in daily_all),
+        6,
+    )
+    realized_pnl_today = round(
+        sum(
+            float(d.get("sell_profit", 0) or 0) - float(d.get("loss", 0) or 0)
+            for d in daily_all
+        ),
+        6,
+    )
+    net_today = round(rewards_today + realized_pnl_today, 6)
+
+    legs_since = db.get_exit_legs_since(day_start)
+    by_method = {m: 0.0 for m in EXIT_METHODS}
+    fill_count_today = 0
+    for leg in legs_since:
+        method = leg.get("exit_method")
+        if method in by_method:
+            by_method[method] += float(leg.get("collateral", 0) or 0)
+        if leg.get("kind") == "reward_buy":
+            fill_count_today += 1
+
+    closed_today = db.get_exit_cycles(statuses=["CLOSED"], closed_after=day_start)
+    exit_cycle_count_today = len(closed_today)
+    mergeish = sum(
+        1
+        for cycle in closed_today
+        if exit_method_label(db.get_exit_legs(cycle["id"])) in ("MERGE", "FOK+MERGE")
+    )
+    marketish = sum(
+        1
+        for cycle in closed_today
+        if exit_method_label(db.get_exit_legs(cycle["id"])) == "MARKET"
+    )
+    merge_exit_ratio = round(mergeish / exit_cycle_count_today, 4) if exit_cycle_count_today else None
+    market_exit_ratio = round(marketish / exit_cycle_count_today, 4) if exit_cycle_count_today else None
+    durations = [
+        float(c.get("holding_duration_sec", 0) or 0) for c in closed_today
+    ]
+    avg_holding_sec = round(sum(durations) / len(durations), 1) if durations else None
+    active_cycles = db.get_non_closed_exit_cycles()
+    oldest_open_inventory = (
+        min(float(c.get("opened_at", 0) or 0) for c in active_cycles)
+        if active_cycles
+        else None
+    )
+
+    # 每市场经济学(纯展示,不做自动黑名单):奖励归属无市场级权威数据 -> 显示未知,
+    # 绝不把 0 或估计值当成真实奖励。
+    per_market: dict = {}
+    for cycle in closed_today + active_cycles:
+        cid = cycle["condition_id"]
+        entry = per_market.setdefault(
+            cid,
+            {
+                "condition_id": cid,
+                "reward_earned": None,
+                "inventory_pnl": 0.0,
+                "fill_count": 0,
+                "merge_ratio": None,
+                "market_ratio": None,
+                "avg_holding_sec": None,
+                "closed_count": 0,
+                "durations": [],
+                "merge_closed": 0,
+                "market_closed": 0,
+            },
+        )
+        legs = db.get_exit_legs(cycle["id"])
+        entry["inventory_pnl"] += sum(
+            float(leg.get("collateral", 0) or 0) for leg in legs
+        )
+        entry["fill_count"] += sum(
+            1 for leg in legs if leg.get("kind") == "reward_buy"
+        )
+        if cycle["status"] == "CLOSED":
+            entry["closed_count"] += 1
+            entry["durations"].append(float(cycle.get("holding_duration_sec", 0) or 0))
+            method = exit_method_label(legs)
+            if method in ("MERGE", "FOK+MERGE"):
+                entry["merge_closed"] += 1
+            if method == "MARKET":
+                entry["market_closed"] += 1
+    per_market_list = []
+    for entry in per_market.values():
+        if entry["closed_count"]:
+            entry["merge_ratio"] = round(
+                entry["merge_closed"] / entry["closed_count"], 4
+            )
+            entry["market_ratio"] = round(
+                entry["market_closed"] / entry["closed_count"], 4
+            )
+            entry["avg_holding_sec"] = round(
+                sum(entry["durations"]) / len(entry["durations"]), 1
+            )
+        entry.pop("durations", None)
+        entry.pop("closed_count", None)
+        entry.pop("merge_closed", None)
+        entry.pop("market_closed", None)
+        per_market_list.append(entry)
+    _enrich_rows(per_market_list, "condition_id")
+    per_market_list.sort(key=lambda e: e["condition_id"])
+
     return jsonify(
         {
             "total_orders": total_orders,
@@ -1673,5 +1878,24 @@ def api_dashboard():
             "total_pnl": total_pnl,
             "wallets": wallet_summaries,
             "templates_without_tiers": templates_without_tiers,
+            "net": {
+                "today": today,
+                "rewards_today": rewards_today,
+                "inventory_pnl_today": realized_pnl_today,
+                "net_today": net_today,
+                "reward_source": "daily_pnl（/activity REWARD+MAKER_REBATE 权威记账）",
+                "inventory_pnl_source": "daily_pnl（get_trades FIFO 已实现）",
+                "reward_unavailable": len(daily_all) == 0,
+            },
+            "exit_breakdown": by_method,
+            "operational": {
+                "fill_count_today": fill_count_today,
+                "exit_cycle_count_today": exit_cycle_count_today,
+                "merge_exit_ratio": merge_exit_ratio,
+                "market_exit_ratio": market_exit_ratio,
+                "avg_holding_sec": avg_holding_sec,
+                "oldest_open_inventory": oldest_open_inventory,
+            },
+            "per_market": per_market_list,
         }
     )

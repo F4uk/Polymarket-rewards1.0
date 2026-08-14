@@ -31,7 +31,7 @@
     </details>
     <table class="data-table" id="wallet-config-table">
         <thead>
-            <tr><th>地址</th><th>余额</th><th>账户类型 / Merge</th><th>存款地址</th><th>代理</th><th>备注</th><th>模板</th><th>状态</th><th>操作</th></tr>
+            <tr><th>地址</th><th>余额</th><th>账户类型 / Merge</th><th>Fast Exit</th><th>新开仓</th><th>存款地址</th><th>代理</th><th>备注</th><th>模板</th><th>状态</th><th>操作</th></tr>
         </thead>
         <tbody id="wallet-config-body"></tbody>
     </table>
@@ -128,19 +128,20 @@
                 <span class="hint">与上项合成结算窗口：只做今天填 0/0，今天+明天填 0/1，只做明天填 1/1，两天以后填 2/空</span>
             </div>
             <div class="form-group">
-                <label>止损方式</label>
+                <label>紧急退出阈值 · 模式</label>
                 <select name="stop_loss_mode" id="stop-loss-mode" onchange="updateStopMode()">
                     <option value="percent">按比例（占成本 %）</option>
                     <option value="fixed">按固定金额（美分）</option>
-                    <option value="off">关闭止损（⚠️套牢仓无兜底，可能扛到归零）</option>
+                    <option value="off">关闭（⚠️ 无紧急退出兜底）</option>
                 </select>
+                <span class="hint">达到阈值后<b>不是无脑市价卖</b>：跳过 Maker 等待，立即比较受保护 Market 与 FOK+Merge 两条路线，选可执行的最优保护路线。</span>
             </div>
             <div class="form-group" id="stop-percent-group">
-                <label>止损比例（占成本 %）</label>
+                <label>紧急退出比例（占成本 %）</label>
                 <input type="number" name="stop_loss_percent" step="1">
             </div>
             <div class="form-group" id="stop-cents-group">
-                <label>强平阈值 θ_stop（美分）</label>
+                <label>紧急退出固定金额（美分）</label>
                 <input type="number" name="theta_stop_cents" step="1">
             </div>
             <div class="form-group">
@@ -174,9 +175,18 @@
             </select>
         </div>
 
-        <h3>Merge-first</h3>
-        <p class="hint" style="color:#888;font-size:12px">仅支持同一普通二元市场的 YES+NO 完整集合；自动 Merge 仅适用于 POLY_1271 Deposit Wallet（Type3）且必须配置 Relayer。Type1/Type2 仍可正常做市，只是不会自动 Merge。完整集合优先合并，不因低余额或止损单边卖出。</p>
+        <h3>成交后库存处理（Fast-Exit V2）</h3>
+        <p class="hint" style="color:#888;font-size:12px">
+            Reward BUY 是为了赚取做市奖励，不是方向性投资：成交即进入<b>库存退出周期</b>，
+            尽快把库存转回抵押品。完整集合<b>先 Merge</b>；单侧残差在受保护直卖（深度计价 + 最差价上界）、
+            FOK 补对侧再 Merge、短时 Maker 逃生三条路线中选择，Maker 等待有上限、不会无限挂成本价。
+            自动 Merge 仅适用于 POLY_1271（Type3）且需配置 Relayer；Type1/Type2 不会自动 Merge，
+            Fast Exit 仍可用 Maker/Market 路径。
+        </p>
         <div class="form-grid">
+            <div class="form-group">
+                <label><input type="checkbox" name="fast_exit_enabled" style="width:auto"> 启用成交后快速库存退出（默认：开）</label>
+            </div>
             <div class="form-group">
                 <label><input type="checkbox" name="merge_enabled" style="width:auto"> 启用自动 Merge（默认：开）</label>
             </div>
@@ -186,9 +196,18 @@
                 <span class="hint">默认 1；配对数量小于此值时不提交 Merge。</span>
             </div>
             <div class="form-group">
-                <label>紧急补全优势下限 (USD)</label>
+                <label>Maker 快速退出等待（秒）</label>
+                <input type="number" name="maker_exit_wait_sec" step="1" min="0" required>
+                <span class="hint">默认 30；0=不等待，立即选受保护直卖或 FOK+Merge。窗口内挂 Maker 卖单（可低于成本，绝不穿价）、对侧 Reward BUY 限量补成完整集合。</span>
+            </div>
+            <div class="form-group">
+                <label>补边 Merge 最低优势 (USD)</label>
                 <input type="number" name="merge_advantage_min_usd" step="0.01" min="0" required>
-                <span class="hint">默认 0.01；只有 FOK 补对侧再 Merge 比直接卖至少多保住这么多价值时才采用。</span>
+                <span class="hint">默认 0.01；FOK 补对侧再 Merge 必须比受保护直卖至少多回收这么多才采用（成交后立即判断，不必等止损）。</span>
+            </div>
+            <div class="form-group">
+                <label><input type="checkbox" name="require_merge_ready_for_new_buys" style="width:auto"> Merge 未就绪时暂停新开仓（默认：开）</label>
+                <span class="hint">Type3 且开启自动 Merge 时，Merge 运行时能力未就绪（Relayer 未配置/验证失败/存款地址不符/交易禁用等）→ 暂停挂新的 Reward BUY；扫描、监控、既有库存退出、既有撤单照常。</span>
             </div>
         </div>
 
@@ -626,9 +645,14 @@ document.getElementById('strategy-form').addEventListener('submit', function(e) 
     });
     const mergeEnabled = this.querySelector('[name="merge_enabled"]');
     data.merge_enabled = !!(mergeEnabled && mergeEnabled.checked);
+    const fastExitEnabled = this.querySelector('[name="fast_exit_enabled"]');
+    data.fast_exit_enabled = !!(fastExitEnabled && fastExitEnabled.checked);
+    const requireMergeReady = this.querySelector('[name="require_merge_ready_for_new_buys"]');
+    data.require_merge_ready_for_new_buys = !!(requireMergeReady && requireMergeReady.checked);
     for (const [key, label] of [
         ['merge_min_shares', '最小 Merge 份数'],
-        ['merge_advantage_min_usd', '紧急补全优势下限'],
+        ['merge_advantage_min_usd', '补边 Merge 最低优势'],
+        ['maker_exit_wait_sec', 'Maker 快速退出等待'],
     ]) {
         if (!Number.isFinite(data[key]) || data[key] < 0) {
             alert(`${label}必须填写大于或等于 0 的有效数字`);
@@ -744,6 +768,8 @@ function loadWallets() {
                 <td title="${w.address}">${w.address.slice(0,6)}...${w.address.slice(-4)}</td>
                 <td>${w.balance != null ? '$' + w.balance.toFixed(2) : '-'}</td>
                 <td title="${escapeHtml(w.trading_block_reason || '')}">${ACCT_TYPES[w.signature_type] || ('sig=' + w.signature_type)}<br><small>${mergeStatusLabel(w)}</small>${w.deposit_wallet_deployed === false ? '<br><small style="color:#c60">Deposit Wallet 尚未部署，需要单独初始化</small>' : ''}</td>
+                <td>${fastExitStatusLabel(w)}</td>
+                <td>${newOpeningLabel(w)}</td>
                 <td title="${w.funder || ''}">${w.funder ? w.funder.slice(0,6)+'...'+w.funder.slice(-4) : '-'}</td>
                 <td title="${w.proxy || ''}">${proxyLabel(w.proxy)}</td>
                 <td title="${escapeHtml(w.address)}">${escapeHtml(w.remark || '')}</td>
@@ -784,6 +810,20 @@ function mergeStatusLabel(w) {
     }
     if (w.merge_status === 'ready') return 'Merge 可用';
     return 'Merge 不可用 · ' + (w.merge_reason_cn || w.merge_reason || '未知原因');
+}
+
+function fastExitStatusLabel(w) {
+    if (w.fast_exit_status === 'disabled') return '未启用（兼容模式）';
+    if (w.fast_exit_status === 'blocked') return '<span style="color:#c00">BLOCKED · 交易禁用</span>';
+    if (w.fast_exit_status === 'degraded') return '仅 Maker/Market（Merge 未就绪）';
+    return '<span style="color:#080">READY</span>';
+}
+
+function newOpeningLabel(w) {
+    if (w.new_opening_allowed === 'paused') {
+        return '<span style="color:#c60">暂停</span><br><small>' + escapeHtml(w.new_opening_reason || '') + '</small>';
+    }
+    return '<span style="color:#080">允许</span>';
 }
 
 const RELAYER_STATUS_META = {

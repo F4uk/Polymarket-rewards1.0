@@ -24,6 +24,21 @@
     <tbody id="status-body"></tbody>
 </table>
 </div>
+
+<h2 style="margin-top:24px">库存退出（Fast-Exit V2）</h2>
+<p class="metric-note">活跃退出周期（ACTIVE / CLOSING / BLOCKED）。Route 与预计回收来自引擎按盘口深度/补边深度实时计算；数据不可用时显示 --，绝不显示假的 0。</p>
+<div class="table-scroll">
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>钱包</th><th>市场</th><th>持仓侧</th><th>残差</th><th>成本</th>
+            <th>库存龄</th><th>配对量</th><th>Market预计回收</th><th>Merge预计回收</th>
+            <th>优势</th><th>Maker剩余</th><th>路线</th><th>周期状态</th><th>阻断原因</th>
+        </tr>
+    </thead>
+    <tbody id="exit-body"></tbody>
+</table>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -67,10 +82,60 @@ function refreshStatus() {
     });
 }
 
+function fmtUsd(v) {
+    if (v == null) return '--';
+    return '$' + Number(v).toFixed(2);
+}
+
+function refreshExit() {
+    fetch('/api/inventory-exit').then(r => r.json()).then(data => {
+        const sel = document.getElementById('wallet-filter').value;
+        const cycles = (data.cycles || []).filter(c => !sel || c.wallet === sel);
+        const body = document.getElementById('exit-body');
+        if (!cycles.length) {
+            body.innerHTML = '<tr><td colspan="14">暂无活跃库存退出周期（Fast Exit 未启用或库存已清零）</td></tr>';
+            return;
+        }
+        body.innerHTML = cycles.map(c => {
+            const age = c.opened_at ? Math.floor(Date.now() / 1000 - c.opened_at) : null;
+            const ageTxt = age != null ? (age < 60 ? age + 's' : Math.floor(age / 60) + 'm' + (age % 60) + 's') : '--';
+            const windowLeft = c.maker_window_until ? Math.max(0, Math.floor(c.maker_window_until - Date.now() / 1000)) : null;
+            const routeMap = {
+                FOK_MERGE: '<span class="profit">FOK+MERGE</span>',
+                DIRECT: 'MARKET（受保护）',
+                MAKER_WINDOW: 'MAKER 窗口',
+                MERGE_FIRST: '等待合并(Merge-first)',
+                BLOCKED: '<span class="loss">BLOCKED</span>',
+                NOOP: '无残差',
+                '': '--',
+            };
+            const statusColor = c.status === 'BLOCKED' ? '#c00' : (c.status === 'CLOSING' ? '#b80' : '#080');
+            return `<tr>
+                <td title="${escapeHtml(c.wallet)}">${escapeHtml(walletLabelOf(c.wallet))}</td>
+                <td>${marketCell(c.market_name, c.condition_id, c.market_url)}</td>
+                <td>${escapeHtml(c.held_side || '--')}</td>
+                <td>${c.managed_qty != null ? c.managed_qty : '--'}</td>
+                <td>${c.cost_basis != null ? Number(c.cost_basis).toFixed(4) : '--'}</td>
+                <td>${ageTxt}</td>
+                <td>${c.paired_qty || '--'}</td>
+                <td>${fmtUsd(c.direct_recovery)}</td>
+                <td>${fmtUsd(c.merge_recovery)}</td>
+                <td>${c.advantage != null ? (c.advantage >= 0 ? '+' : '') + Number(c.advantage).toFixed(2) : '--'}</td>
+                <td>${windowLeft != null ? (windowLeft + 's') : '--'}</td>
+                <td>${routeMap[c.selected_route] || escapeHtml(c.selected_route || '--')}</td>
+                <td style="color:${statusColor}">${escapeHtml(c.status)}</td>
+                <td>${escapeHtml(c.error || '--')}</td>
+            </tr>`;
+        }).join('');
+    }).catch(() => {});
+}
+
 // 先等备注映射就绪再首渲染,否则表格会先闪一遍短地址再变备注。
 fillWalletSelect(document.getElementById('wallet-filter')).then(() => {
     refreshStatus();
+    refreshExit();
     setInterval(refreshStatus, 4000);
+    setInterval(refreshExit, 4000);
 });
 </script>
 {% endblock %}

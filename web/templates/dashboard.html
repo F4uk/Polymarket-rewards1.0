@@ -30,6 +30,37 @@
     <div class="stat-card"><h3>合格市场</h3><div class="v" id="eligible-count">-</div></div>
 </div>
 
+<h2>今日真实净结果</h2>
+<p class="metric-note" id="net-source-note"></p>
+<div class="stat-cards">
+    <div class="stat-card"><h3>今日 Rewards</h3><div class="v" id="net-rewards">--</div></div>
+    <div class="stat-card"><h3>今日库存已实现 PnL</h3><div class="v" id="net-inventory-pnl">--</div></div>
+    <div class="stat-card"><h3>今日净收益</h3><div class="v" id="net-total">--</div></div>
+</div>
+<div class="table-scroll" style="margin-top:12px">
+<table class="data-table">
+    <thead><tr><th>退出方式</th><th>今日 PnL (USD)</th></tr></thead>
+    <tbody id="net-breakdown"></tbody>
+</table>
+</div>
+
+<h2>运营指标</h2>
+<div class="table-scroll" style="margin-top:12px">
+<table class="data-table">
+    <thead><tr><th>成交数(今日)</th><th>退出周期(今日)</th><th>Merge 退出占比</th><th>Market 退出占比</th><th>平均持仓时长</th><th>最老未平库存</th></tr></thead>
+    <tbody id="operational-body"></tbody>
+</table>
+</div>
+
+<h2>每市场经济学（展示/审计用，不做自动黑名单）</h2>
+<p class="metric-note">奖励归属目前无市场级权威数据，显示 --（不填 0、不估）。</p>
+<div class="table-scroll" style="margin-top:12px">
+<table class="data-table">
+    <thead><tr><th>市场</th><th>Reward earned</th><th>库存已实现 PnL</th><th>净结果</th><th>成交数</th><th>Merge 占比</th><th>平均持仓</th></tr></thead>
+    <tbody id="per-market-body"></tbody>
+</table>
+</div>
+
 <h2>钱包状态</h2>
 <table class="data-table" id="wallet-table">
     <thead>
@@ -63,6 +94,44 @@ function refreshDashboard() {
         document.getElementById('total-orders').textContent = data.total_orders;
         document.getElementById('total-positions').textContent = data.total_positions;
         document.getElementById('total-pnl').textContent = (data.total_pnl || 0).toFixed(2) + ' pUSD';
+        const net = data.net || {};
+        document.getElementById('net-rewards').textContent =
+            net.reward_unavailable ? '待记账' : '$' + Number(net.rewards_today || 0).toFixed(2);
+        document.getElementById('net-inventory-pnl').textContent =
+            '$' + Number(net.inventory_pnl_today || 0).toFixed(2);
+        document.getElementById('net-total').textContent =
+            net.reward_unavailable ? '待记账' : '$' + Number(net.net_today || 0).toFixed(2);
+        document.getElementById('net-source-note').textContent =
+            'Rewards 来源：' + (net.reward_source || '') + '；库存 PnL 来源：' + (net.inventory_pnl_source || '') +
+            (net.reward_unavailable ? '。今日奖励尚未记账/结算，显示待记账而非 0。' : '');
+        const breakRows = data.exit_breakdown || {};
+        const METHOD_CN = {MERGE: 'MERGE PnL', 'FOK+MERGE': 'FOK+MERGE PnL', MAKER: 'MAKER PnL', MARKET: 'MARKET PnL'};
+        document.getElementById('net-breakdown').innerHTML =
+            Object.entries(METHOD_CN).map(([k, label]) =>
+                `<tr><td>${label}</td><td>$${Number(breakRows[k] || 0).toFixed(2)}</td></tr>`
+            ).join('') ||
+            '<tr><td colspan="2">--</td></tr>';
+        const op = data.operational || {};
+        document.getElementById('operational-body').innerHTML = `<tr>
+            <td>${op.fill_count_today ?? '--'}</td>
+            <td>${op.exit_cycle_count_today ?? '--'}</td>
+            <td>${op.merge_exit_ratio != null ? (op.merge_exit_ratio * 100).toFixed(0) + '%' : '--'}</td>
+            <td>${op.market_exit_ratio != null ? (op.market_exit_ratio * 100).toFixed(0) + '%' : '--'}</td>
+            <td>${op.avg_holding_sec != null ? Math.floor(op.avg_holding_sec) + 's' : '--'}</td>
+            <td>${op.oldest_open_inventory ? relTime(op.oldest_open_inventory) : '--'}</td>
+        </tr>`;
+        const perMarket = data.per_market || [];
+        document.getElementById('per-market-body').innerHTML = perMarket.length
+            ? perMarket.map(m => `<tr>
+                <td>${marketCell(m.market_name, m.condition_id, m.market_url)}</td>
+                <td>--</td>
+                <td class="${(m.inventory_pnl || 0) >= 0 ? 'profit' : 'loss'}">$${Number(m.inventory_pnl || 0).toFixed(2)}</td>
+                <td class="${(m.inventory_pnl || 0) >= 0 ? 'profit' : 'loss'}">$${Number(m.inventory_pnl || 0).toFixed(2)}</td>
+                <td>${m.fill_count ?? '--'}</td>
+                <td>${m.merge_ratio != null ? (m.merge_ratio * 100).toFixed(0) + '%' : '--'}</td>
+                <td>${m.avg_holding_sec != null ? Math.floor(m.avg_holding_sec) + 's' : '--'}</td>
+            </tr>`).join('')
+            : '<tr><td colspan="7">暂无库存退出数据</td></tr>';
         const engineRunning = (data.wallets || []).some(w => w.running);
         document.getElementById('engine-status').innerHTML =
             `<span class="status ${engineRunning ? 'running' : 'stopped'}">${engineRunning ? '运行中' : '已停止'}</span>`;

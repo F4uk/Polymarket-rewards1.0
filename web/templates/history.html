@@ -5,7 +5,7 @@
 
 <div class="filter-bar">
     <label>钱包：</label>
-    <select id="wallet-filter" onchange="reload()">
+    <select id="wallet-filter" onchange="reload(); refreshExitCycles()">
         <option value="">全部</option>
     </select>
     <label>动作：</label>
@@ -42,6 +42,41 @@
     <span id="page-info" style="margin:0 10px"></span>
     <button class="btn btn-sm" id="next-page" onclick="nextPage()">下一页</button>
 </div>
+
+<h2 style="margin-top:28px">库存退出周期（Fast-Exit V2）</h2>
+<p class="metric-note">每个 Reward BUY 成交开启一个库存退出周期；退出方式：MERGE / FOK+MERGE / MAKER / MARKET / MIXED。点「展开」查看买入、补边、Merge、卖出各腿。</p>
+<div class="filter-bar">
+    <label>退出方式：</label>
+    <select id="exit-method-filter" onchange="refreshExitCycles()">
+        <option value="">全部</option>
+        <option value="MERGE">MERGE</option>
+        <option value="FOK+MERGE">FOK+MERGE</option>
+        <option value="MAKER">MAKER</option>
+        <option value="MARKET">MARKET</option>
+        <option value="MIXED">MIXED</option>
+    </select>
+    <label>状态：</label>
+    <select id="exit-status-filter" onchange="refreshExitCycles()">
+        <option value="">全部</option>
+        <option value="CLOSED">CLOSED</option>
+        <option value="ACTIVE">ACTIVE</option>
+        <option value="CLOSING">CLOSING</option>
+        <option value="BLOCKED">BLOCKED</option>
+    </select>
+    <button class="btn btn-sm" onclick="refreshExitCycles()">刷新</button>
+</div>
+<div class="table-scroll">
+<table class="data-table">
+    <thead>
+        <tr>
+            <th>开启时间</th><th>钱包</th><th>市场</th><th>持仓侧</th><th>初始库存</th>
+            <th>退出方式</th><th>回收 (USD)</th><th>库存损益 (USD)</th><th>持仓时间</th>
+            <th>状态</th><th></th>
+        </tr>
+    </thead>
+    <tbody id="exit-cycles-body"></tbody>
+</table>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -70,7 +105,136 @@ const ACTION_LABELS = {
     buy_reconcile_cancel: '撤改收敛撤单',
     blacklist_cancel: '黑名单撤单',
     uma_resolution_cancel: 'UMA结算撤买单',
+    exit_cycle_opened: '开启库存退出周期',
+    exit_cycle_closed: '库存退出周期关闭',
+    exit_inventory_cancel: '库存退出限制撤单',
+    exit_maker_rest: 'MAKER 逃生窗口挂卖单',
+    exit_market_protected: '受保护直卖',
+    exit_fok_submitted: 'FOK 补边已提交',
+    exit_fok_failed: 'FOK 补边被拒',
+    exit_fok_indeterminate: 'FOK 结果未知·禁并行卖出',
+    fok_pre_cancel: 'FOK 前置撤单',
 };
+
+const EXIT_CYCLE_PAGE_SIZE = 50;
+let exitCyclePage = 1;
+
+function fmtDuration(sec) {
+    if (sec == null) return '--';
+    sec = Math.floor(Number(sec) || 0);
+    if (sec < 60) return sec + 's';
+    if (sec < 3600) return Math.floor(sec / 60) + 'm' + (sec % 60) + 's';
+    return Math.floor(sec / 3600) + 'h' + Math.floor((sec % 3600) / 60) + 'm';
+}
+
+function legRows(legs) {
+    const KIND_LABELS = {
+        reward_buy: '买入',
+        complement_buy: '补边',
+        merge: 'Merge',
+        maker_sell: '卖出(MAKER)',
+        market_sell: '卖出(MARKET)',
+    };
+    return (legs || []).map(l => `
+        <tr>
+            <td>${escapeHtml(new Date(l.created_at * 1000).toLocaleString('zh-CN'))}</td>
+            <td>${escapeHtml(KIND_LABELS[l.kind] || l.kind)}${l.exit_method ? ' <small>· ' + escapeHtml(l.exit_method) + '</small>' : ''}</td>
+            <td>${escapeHtml(l.side || '--')}</td>
+            <td>${l.qty != null ? l.qty : '--'}</td>
+            <td>${l.price ? Number(l.price).toFixed(4) : '--'}</td>
+            <td>${l.collateral != null ? Number(l.collateral).toFixed(4) : '--'}</td>
+            <td>${escapeHtml(l.status || '')}</td>
+            <td>${escapeHtml((l.order_id || l.relayer_id || l.note || '').slice(0, 40))}</td>
+        </tr>`).join('');
+}
+
+function renderExitCycles(cycles) {
+    const methodFilter = document.getElementById('exit-method-filter').value;
+    const statusFilter = document.getElementById('exit-status-filter').value;
+    let rows = (cycles || []).filter(c => {
+        if (methodFilter && c.method !== methodFilter) return false;
+        if (statusFilter && c.status !== statusFilter) return false;
+        return true;
+    });
+    const body = document.getElementById('exit-cycles-body');
+    body.innerHTML = '';
+    if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="11">暂无库存退出周期记录</td></tr>';
+        return;
+    }
+    rows.forEach((c, i) => {
+        const tr = document.createElement('tr');
+        const methodClass = /FOK\+MERGE|MERGE/.test(c.method || '') ? 'profit' : (/MAKER/.test(c.method || '') ? '' : (c.method === 'MARKET' ? 'loss' : ''));
+        tr.innerHTML = `
+            <td>${escapeHtml(new Date(c.opened_at * 1000).toLocaleString('zh-CN'))}</td>
+            <td title="${escapeHtml(c.wallet)}">${escapeHtml(walletLabelOf(c.wallet))}</td>
+            <td>${marketCell(c.market_name, c.condition_id, c.market_url)}</td>
+            <td>${escapeHtml(c.held_side || '--')}</td>
+            <td>${c.initial_qty != null ? c.initial_qty : '--'}</td>
+            <td class="${methodClass}">${escapeHtml(c.method || '--')}</td>
+            <td>${c.realized_recovered_collateral != null ? Number(c.realized_recovered_collateral).toFixed(2) : '--'}</td>
+            <td class="${(c.inventory_pnl || 0) >= 0 ? 'profit' : 'loss'}">${c.inventory_pnl != null ? Number(c.inventory_pnl).toFixed(2) : '--'}</td>
+            <td>${fmtDuration(c.holding_duration_sec)}</td>
+            <td>${escapeHtml(c.status)}</td>
+            <td><span class="expand-btn" onclick="toggleExitCycleLegs(${c.id}, ${i})">▸ 展开</span></td>`;
+        body.appendChild(tr);
+    });
+    // 跨轮保持展开的腿
+    rows.forEach((c, i) => {
+        if (window._exitLegsOpen && window._exitLegsOpen[c.id]) {
+            insertExitLegsRow(c, i);
+        }
+    });
+}
+
+function insertExitLegsRow(c, i) {
+    const rows = document.querySelectorAll('#exit-cycles-body tr');
+    const anchor = rows[i];
+    if (!anchor) return;
+    const tr = document.createElement('tr');
+    tr.id = 'exit-legs-' + c.id;
+    tr.innerHTML = `<td colspan="11" style="padding:0">
+        <div class="ladder-wrap">
+            <table class="data-table">
+                <thead><tr><th>时间</th><th>腿</th><th>方向</th><th>数量</th><th>价格</th><th>现金流</th><th>状态</th><th>订单/说明</th></tr></thead>
+                <tbody>${legRows(c.legs)}</tbody>
+            </table>
+        </div>
+    </td>`;
+    anchor.parentNode.insertBefore(tr, anchor.nextSibling);
+}
+
+function toggleExitCycleLegs(id, i) {
+    window._exitLegsOpen = window._exitLegsOpen || {};
+    const open = !window._exitLegsOpen[id];
+    window._exitLegsOpen[id] = open;
+    const rows = document.querySelectorAll('#exit-cycles-body tr');
+    if (!open) {
+        const el = document.getElementById('exit-legs-' + id);
+        if (el) el.remove();
+        const anchor = rows[i];
+        if (anchor) anchor.querySelector('.expand-btn').textContent = '▸ 展开';
+        return;
+    }
+    const cycle = window._exitCyclesData.find(c => c.id === id);
+    if (cycle) {
+        const anchor = rows[i];
+        if (anchor) anchor.querySelector('.expand-btn').textContent = '▾ 收起';
+        insertExitLegsRow(cycle, i);
+    }
+}
+
+function refreshExitCycles() {
+    const wallet = document.getElementById('wallet-filter').value;
+    const status = document.getElementById('exit-status-filter').value;
+    const params = new URLSearchParams({page: exitCyclePage, page_size: EXIT_CYCLE_PAGE_SIZE});
+    if (wallet) params.set('wallet', wallet);
+    if (status) params.set('status', status);
+    fetch(`/api/exit-cycles?${params}`).then(r => r.json()).then(data => {
+        window._exitCyclesData = data.cycles || [];
+        renderExitCycles(window._exitCyclesData);
+    }).catch(() => {});
+}
 
 const PAGE_SIZE = 100;
 let currentPage = 1;
@@ -136,6 +300,9 @@ function refreshActions() {
 })();
 
 // 先等备注映射就绪再首渲染,否则表格会先闪一遍短地址再变备注。
-fillWalletSelect(document.getElementById('wallet-filter')).then(refreshActions);
+fillWalletSelect(document.getElementById('wallet-filter')).then(() => {
+    refreshActions();
+    refreshExitCycles();
+});
 </script>
 {% endblock %}

@@ -166,6 +166,8 @@ class ExitRouter:
         self._positions = positions or []
         self._open_orders = open_orders or []
         self._tmpl = None
+        self._snap_assets = {}
+        self._snap_conditions = {}
         self._positions_by_cid = {}
         for p in self._positions:
             if _num(p.get("size")) > 0:
@@ -190,7 +192,14 @@ class ExitRouter:
         """
         try:
             self._open_orders = open_orders or self._open_orders
-            return self._route_position(pos)
+            handled = self._route_position(pos)
+            # 路由完成后立刻发布状态(UI 不滞后一个 tick);reconcile 开头的发布只覆盖
+            # 本 tick 未路由的仓(成本未知/上游接管)。
+            try:
+                self._publish_status()
+            except Exception:
+                pass
+            return handled
         except Exception as e:
             logger.warning("exit router error on %s: %s", pos.get("asset"), e, exc_info=True)
             return False
@@ -224,7 +233,10 @@ class ExitRouter:
         if merge_enabled:
             pair = self._pair_for(cid, asset_id)
             if pair:
-                return self._pair_merge_route(pos, pair, size, cost, lots, tick_str, tmpl)
+                handled = self._pair_merge_route(pos, pair, size, cost, lots, tick_str, tmpl)
+                if handled:
+                    return True
+                # 不够最小份数 / Relayer 不可用:落到单侧路由(Maker/FAK 照常周转)。
         if stop_hit:
             return self._route_compare(pos, size, cost, lots, tick, tick_str, best_bid, tmpl)
         if exit_wait <= 0:
@@ -416,10 +428,17 @@ class ExitRouter:
             return False
 
     def _complement_token(self, cid: str, asset_id: str):
-        """同市场另一侧 token(取 Data API 持仓或盘口侧);未知返回 None。"""
+        """同市场另一侧 token:先看实际持仓(手工补对),再看扫描缓存(奖励市场两侧
+        都在 eligible_markets 里);都拿不到返回 None(FOK 路由降级为直接 FAK)。"""
         pair = self._pair_for(cid, asset_id)
         if pair:
             return pair[0]
+        try:
+            for row in self.db.get_eligible_markets():
+                if row.get("market_id") == cid and row.get("token_id") != asset_id:
+                    return row.get("token_id", "")
+        except Exception as e:
+            logger.warning("exit: eligible lookup for complement failed: %s", e)
         return None
 
     # ---------------------------------------------------------------- FOK+Merge
@@ -589,6 +608,12 @@ class ExitRouter:
 
     def _submit_merge(self, event_id, cid, yes_asset, no_asset, amount, tick_str):
         """预留后提交 Merge 交易(必要时先批量授权)。失败不改变事件状态 -> 下 tick 重试。"""
+        # Merge 前撤掉两侧冲突挂卖单:整对份额不能被卖单占用,否则链上烧不动。
+        try:
+            self._cancel_sells(yes_asset, cid, amount)
+            self._cancel_sells(no_asset, cid, amount)
+        except Exception as e:
+            logger.warning("exit: pre-merge sell cancel failed: %s", e)
         neg_risk = self._neg_risk(yes_asset or no_asset)
         try:
             approved = self.api.is_merge_adapter_approved(self._funder(), neg_risk)
@@ -805,9 +830,10 @@ class ExitRouter:
             pass
 
     def _publish_status(self):
-        """汇总本 tick 快照 -> exit_status 模块(UI 只读,不做重复盘口请求)。"""
-        self._snap_assets = {}
-        self._snap_conditions = {}
+        """把本 tick 已累积的路由标记发布到 exit_status 模块(UI 只读)。
+
+        不重置累积表:reconcile_pending 在 tick 开头清空,route_position 逐仓追加,
+        每仓路由完即发布一次,UI 状态不滞后。"""
         active = 0
         try:
             active += self.db.count_active_merge_events(self.wallet_address)

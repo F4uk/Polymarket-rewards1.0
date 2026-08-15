@@ -82,6 +82,14 @@ TEMPLATE_DEFAULTS = {
     "gap_veto_cents": 0,
     # 止盈方式:maker=挂卖一吃价差(默认);market=浮盈(成本<买一)立即市价清仓。
     "take_profit_mode": "maker",
+    # 快速退出:Reward BUY 成交后的 Maker 等待秒数(0=不等待 Maker,直接比价路由)。
+    # 等待截止时间取自最老一笔在持 FIFO 买入成交的交易所时间戳,重启/部分成交不重置。
+    "exit_maker_wait_sec": 60,
+    # Merge:YES+NO 整对回收抵押品。需 Relayer 凭证;不可用时 Maker/Protected FAK 照常。
+    "merge_enabled": False,
+    "merge_min_shares": 1,  # 单笔 Merge 的最少整对份数(低于不 Merge)
+    "merge_min_advantage_usd": 0.01,  # FOK+Merge 相比直接 FAK 至少要多回收这么多才选它
+    "merge_confirm_timeout_sec": 120,  # 提交后等待 Relayer/链上确认的超时
     "included_categories": DEFAULT_INCLUDED_CATEGORIES,
     "include_other": True,
     "max_exposure_usd": 250,

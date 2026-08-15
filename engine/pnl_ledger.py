@@ -5,11 +5,13 @@
 """
 
 import logging
+import time
 from datetime import datetime, timedelta
 
 from py_clob_client_v2.clob_types import TradeParams
 from engine.fills import extract_fills
-from engine.pnl import reward_rebate_by_day, realized_pnl_by_day, our_traded_assets
+from engine.merge_accounting import merge_pnl_by_day
+from engine.pnl import reward_rebate_by_day, realized_pnl_by_day, our_traded_assets, beijing_day
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,12 @@ def rebuild_wallet_pnl(api, db, wallet, from_date, to_date):
             agg["loss"] += v["loss"]
             agg["fee"] += v["fee"]
 
+    # Merge 盈亏:只累计 CONFIRMED 事件(READY/SUBMITTED/FAILED 贡献 0),按确认的
+    # 北京时间归日。事件表是唯一事实来源 —— 重算多少次都只计一次(幂等)。
+    merge_by_day = merge_pnl_by_day(
+        db.get_confirmed_merge_events(wallet=wallet),
+        beijing_day,
+    )
     for d in _date_range(from_date, to_date):
         r = rr.get(d, {})
         z = realized.get(d, {})
@@ -59,4 +67,5 @@ def rebuild_wallet_pnl(api, db, wallet, from_date, to_date):
             sell_profit=z.get("sell_profit", 0.0),
             loss=z.get("loss", 0.0),
             fee=z.get("fee", 0.0),
+            merge_pnl=merge_by_day.get(d, 0.0),
         )

@@ -90,6 +90,20 @@ class WalletWorker:
         self.monitor = OrderMonitor(
             api, db, wallet_address, on_reward_update=on_reward_update
         )
+        # 快速退出路由器:复用 monitor 的成交/盘口缓存(每 tick 预取表),记录动作与
+        # 状态走 monitor 的回调。所有网络/DB 副作用都经 api/db,测试可整体替换。
+        from engine.exit_router import ExitRouter
+
+        self.exit_router = ExitRouter(
+            api,
+            db,
+            wallet_address,
+            cost_lots=self.monitor._cost_lots,
+            sell_book=self.monitor._sell_book,
+            status_add=self.monitor._status_add,
+            record_action=self.monitor._record_action,
+        )
+        self.monitor.exit_router = self.exit_router
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self.running = False
@@ -1232,6 +1246,20 @@ class EngineManager:
                 logger.error(
                     "Watermark init failed for %s: %s", worker.wallet_address, e
                 )
+            # 重启恢复:先对账 READY/SUBMITTED 的 Merge 操作(真实余额/订单/Relayer 状态),
+            # 再让任何新副作用发生 —— 防「FOK #1 已提交、重启后 FOK #2 重复补对」。
+            router = getattr(worker.monitor, "exit_router", None)
+            if router is not None:
+                try:
+                    positions = worker.api.get_user_positions(worker.api.get_funder())
+                    open_orders = worker.api.get_open_orders()
+                    router.reconcile_pending(positions, open_orders)
+                except Exception as e:
+                    logger.warning(
+                        "Exit recovery failed for %s (下个 tick 再对账): %s",
+                        worker.wallet_address,
+                        e,
+                    )
 
     def get_status(self) -> dict:
         """Get status of all engines."""

@@ -43,10 +43,19 @@ _MISSING = object()
 
 
 class OrderMonitor:
-    def __init__(self, api, db, wallet_address: str, on_reward_update=None):
+    def __init__(
+        self,
+        api,
+        db,
+        wallet_address: str,
+        on_reward_update=None,
+        exit_router=None,
+    ):
         self.api = api
         self.db = db
         self.wallet_address = wallet_address
+        # 快速退出路由器(WalletWorker 注入;None=不启用,测试/直连构造行为不变)。
+        self.exit_router = exit_router
         # 实时奖励写回候选池的回调(manager 注入);None=不写回(测试/临时下单 worker)。
         self.on_reward_update = on_reward_update
         # Dedup processed buy fills by (trade_id, order_id).
@@ -59,6 +68,8 @@ class OrderMonitor:
         self._prime_pending: bool = False
         # condition_id -> ((max_spread, daily_rate), fetched_at) TTL cache for Step 3.
         self._rewards_cache: dict = {}
+        # condition_id -> CONFIRMED Merge 事件(每 tick 重置):成本重建的库存消耗依据。
+        self._merge_events_cache: dict = {}
         self._status_rows: list = []
         self._tick_ts: float = 0.0
         self._cost_cache: dict = {}  # asset_id -> 加权成本 or None(每 tick 重置)
@@ -90,6 +101,7 @@ class OrderMonitor:
         self._cancelled_sell_ids = set()
         self._trades_by_cid = {}
         self._book_cache = {}
+        self._merge_events_cache = {}
 
     def _status_add(self, **fields) -> None:
         try:
@@ -221,9 +233,24 @@ class OrderMonitor:
             self._cost_cache[asset_id] = (None, [])
             return None, []
         fills = extract_fills(trades, funder, asset_id)
-        result = position_cost_with_lots(fills, size)
+        result = position_cost_with_lots(fills, size, self._merge_events_for(condition_id))
         self._cost_cache[asset_id] = result
         return result
+
+    def _merge_events_for(self, condition_id: str) -> list:
+        """该市场 CONFIRMED 的 Merge 事件(按确认时间正序),供 FIFO 重建消耗。"""
+        if condition_id not in self._merge_events_cache:
+            try:
+                events = [
+                    e
+                    for e in self.db.get_confirmed_merge_events()
+                    if e.get("condition_id") == condition_id
+                ]
+                events.sort(key=lambda e: float(e.get("confirmed_at", 0) or 0))
+            except Exception:
+                events = []
+            self._merge_events_cache[condition_id] = events
+        return self._merge_events_cache[condition_id]
 
     # --- Step 1: fills via get_trades (flatten maker_orders) ---
     def check_buy_orders(self):
@@ -633,6 +660,13 @@ class OrderMonitor:
             )
         except Exception as e:
             logger.warning("[离场] 预取失败(退回逐仓自取): %s", e)
+        # 快速退出路由:每 tick 先对账实际持仓/挂单 + 恢复活动 Merge 操作(重启恢复/
+        # delayed FOK 防重入都在这),再逐仓路由。真实余额永远优先于本地假设。
+        if self.exit_router is not None:
+            try:
+                self.exit_router.reconcile_pending(positions, open_orders)
+            except Exception as e:
+                logger.warning("[离场] 快速退出对账失败: %s", e)
         for pos in positions:
             if pos.get("asset", "") in self._just_dumped:
                 continue  # 本 tick 已被低余额清仓卖掉:Data API /positions 滞后仍显满仓,
@@ -675,6 +709,14 @@ class OrderMonitor:
             # 结算清仓:结果已提交,无视盈亏、无视成本是否算得出,市价清掉该持仓。
             self._resolution_dump(cid, asset_id, size, cur, cost, lots, open_orders)
             return
+        # 快速退出路由接管(有成本/活动的持仓);返回 True 表示本仓已由路由处理,
+        # 上游的 park-at-cost 离场不再执行。路由异常时返回 False 落到上游行为。
+        if self.exit_router is not None:
+            try:
+                if self.exit_router.route_position(pos, open_orders):
+                    return
+            except Exception as e:
+                logger.warning("exit router hook failed on %s: %s", asset_id, e)
         if cost is None or cost <= 0:
             logger.warning(
                 "Exit skipped (no buy fills) asset=%s size=%s — UNPROTECTED",

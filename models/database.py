@@ -184,10 +184,35 @@ class Database:
                 sell_profit REAL NOT NULL DEFAULT 0,
                 loss REAL NOT NULL DEFAULT 0,
                 fee REAL NOT NULL DEFAULT 0,
+                merge_pnl REAL NOT NULL DEFAULT 0,
                 net REAL NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL DEFAULT (strftime('%s','now')),
                 PRIMARY KEY (wallet, date)
             );
+            CREATE TABLE IF NOT EXISTS merge_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                yes_token_id TEXT NOT NULL DEFAULT '',
+                no_token_id TEXT NOT NULL DEFAULT '',
+                route TEXT NOT NULL DEFAULT 'PAIR',
+                amount REAL NOT NULL DEFAULT 0,
+                yes_cost REAL NOT NULL DEFAULT 0,
+                no_cost REAL NOT NULL DEFAULT 0,
+                complement_order_id TEXT NOT NULL DEFAULT '',
+                complement_status TEXT NOT NULL DEFAULT '',
+                recovered_usd REAL NOT NULL DEFAULT 0,
+                realized_pnl REAL NOT NULL DEFAULT 0,
+                relayer_tx_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'READY',
+                error_message TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL DEFAULT (strftime('%s','now')),
+                updated_at REAL NOT NULL DEFAULT (strftime('%s','now')),
+                confirmed_at REAL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_merge_events_active
+                ON merge_events(wallet, condition_id)
+                WHERE status IN ('READY','SUBMITTED');
         """
         )
         self.conn.commit()
@@ -238,6 +263,11 @@ class Database:
         wcols = {row[1] for row in c.fetchall()}
         if "template_id" not in wcols:
             c.execute("ALTER TABLE wallets ADD COLUMN template_id INTEGER")
+            self.conn.commit()
+        c.execute("PRAGMA table_info(daily_pnl)")
+        dcols = {row[1] for row in c.fetchall()}
+        if dcols and "merge_pnl" not in dcols:
+            c.execute("ALTER TABLE daily_pnl ADD COLUMN merge_pnl REAL NOT NULL DEFAULT 0")
             self.conn.commit()
         c.execute("SELECT COUNT(*) AS n FROM templates")
         if c.fetchone()["n"] == 0:
@@ -855,6 +885,154 @@ class Database:
         c.execute("SELECT condition_id FROM blacklist")
         return {row["condition_id"] for row in c.fetchall()}
 
+    # --- Merge events (快速退出:补对 + 回收;幂等,重启恢复的依据) ---
+
+    MERGE_ACTIVE_STATUSES = ("READY", "SUBMITTED")
+
+    def create_merge_event(
+        self,
+        wallet: str,
+        condition_id: str,
+        route: str = "PAIR",
+        amount: float = 0.0,
+        yes_token_id: str = "",
+        no_token_id: str = "",
+        yes_cost: float = 0.0,
+        no_cost: float = 0.0,
+        complement_order_id: str = "",
+    ) -> int:
+        """创建一笔 Merge 操作(READY)。同钱包+同市场已有活动操作(READY/SUBMITTED)时
+        由 DB 部分唯一索引拒绝(IntegrityError),调用方据此绝不复购补对。"""
+        c = self.conn.cursor()
+        c.execute(
+            "INSERT INTO merge_events (wallet, condition_id, route, amount,"
+            " yes_token_id, no_token_id, yes_cost, no_cost, complement_order_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                wallet,
+                condition_id,
+                route,
+                amount,
+                yes_token_id,
+                no_token_id,
+                yes_cost,
+                no_cost,
+                complement_order_id,
+            ),
+        )
+        self.conn.commit()
+        return c.lastrowid
+
+    def get_active_merge_event(self, wallet: str, condition_id: str) -> dict | None:
+        """该钱包+市场当前活动(READY/SUBMITTED)的 Merge 操作,没有返回 None。"""
+        c = self.conn.cursor()
+        c.execute(
+            "SELECT * FROM merge_events WHERE wallet = ? AND condition_id = ?"
+            " AND status IN ('READY','SUBMITTED') ORDER BY id DESC LIMIT 1",
+            (wallet, condition_id),
+        )
+        row = c.fetchone()
+        return dict(row) if row else None
+
+    def get_merge_event(self, event_id: int) -> dict | None:
+        c = self.conn.cursor()
+        c.execute("SELECT * FROM merge_events WHERE id = ?", (int(event_id),))
+        row = c.fetchone()
+        return dict(row) if row else None
+
+    def update_merge_event(self, event_id: int, **fields):
+        """更新 Merge 事件(白名单字段),自动刷新 updated_at。返回受影响行数。"""
+        allowed = {
+            "yes_token_id", "no_token_id", "route", "amount", "yes_cost", "no_cost",
+            "complement_order_id", "complement_status", "recovered_usd", "realized_pnl",
+            "relayer_tx_id", "status", "error_message", "confirmed_at",
+        }
+        sets = []
+        params = []
+        for k, v in fields.items():
+            if k not in allowed:
+                raise ValueError(f"merge event field not allowed: {k}")
+            sets.append(f"{k} = ?")
+            params.append(v)
+        if not sets:
+            return 0
+        params.append(int(event_id))
+        c = self.conn.cursor()
+        c.execute(
+            f"UPDATE merge_events SET {', '.join(sets)}, updated_at=strftime('%s','now')"
+            " WHERE id = ?",
+            params,
+        )
+        self.conn.commit()
+        return c.rowcount
+
+    def list_merge_events(
+        self,
+        wallet: str = None,
+        statuses: list[str] = None,
+        start: float = None,
+        end: float = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple:
+        """Merge 记录分页查询,返回 (rows, total)。start/end 为 created_at 的 epoch 窗口。"""
+        clause = "WHERE 1=1"
+        params = []
+        if wallet:
+            clause += " AND wallet = ?"
+            params.append(wallet)
+        if statuses:
+            ph = ",".join("?" * len(statuses))
+            clause += f" AND status IN ({ph})"
+            params.extend(statuses)
+        if start:
+            clause += " AND created_at >= ?"
+            params.append(float(start))
+        if end:
+            clause += " AND created_at <= ?"
+            params.append(float(end))
+        c = self.conn.cursor()
+        c.execute(f"SELECT COUNT(*) FROM merge_events {clause}", params)
+        total = c.fetchone()[0]
+        c.execute(
+            f"SELECT * FROM merge_events {clause} ORDER BY created_at DESC, id DESC"
+            " LIMIT ? OFFSET ?",
+            params + [int(limit), int(offset)],
+        )
+        return [dict(r) for r in c.fetchall()], total
+
+    def get_confirmed_merge_events(
+        self, from_ts: float = None, to_ts: float = None, wallet: str = None
+    ) -> list[dict]:
+        """CONFIRMED 事件(盈亏台账重算用,幂等:按事件只计一次)。"""
+        clause = "WHERE status = 'CONFIRMED'"
+        params = []
+        if wallet:
+            clause += " AND wallet = ?"
+            params.append(wallet)
+        if from_ts is not None:
+            clause += " AND confirmed_at >= ?"
+            params.append(float(from_ts))
+        if to_ts is not None:
+            clause += " AND confirmed_at <= ?"
+            params.append(float(to_ts))
+        c = self.conn.cursor()
+        c.execute(
+            f"SELECT * FROM merge_events {clause} ORDER BY confirmed_at, id", params
+        )
+        return [dict(r) for r in c.fetchall()]
+
+    def count_active_merge_events(self, wallet: str = None) -> int:
+        """活动(READY/SUBMITTED)Merge 操作数,仪表盘「退出处理中」的一项。"""
+        clause = "WHERE status IN ('READY','SUBMITTED')"
+        params = []
+        if wallet:
+            clause += " AND wallet = ?"
+            params.append(wallet)
+        c = self.conn.cursor()
+        c.execute(f"SELECT COUNT(*) FROM merge_events {clause}", params)
+        return c.fetchone()[0]
+
     # --- Net worth history (每钱包净值快照:启动 + 每日) ---
 
     def get_market_daily_reward(self, condition_id):
@@ -874,18 +1052,24 @@ class Database:
         row = c.fetchone()
         return float(row["m"]) if row and row["m"] is not None else None
 
-    def upsert_daily_pnl(self, wallet, date, reward, rebate, sell_profit, loss, fee):
-        """幂等写入某钱包某日盈亏行(主键 wallet+date,补漏/重算安全覆盖)。net 内部算。"""
-        net = reward + rebate + sell_profit - loss - fee
+    def upsert_daily_pnl(
+        self, wallet, date, reward, rebate, sell_profit, loss, fee, merge_pnl=0.0
+    ):
+        """幂等写入某钱包某日盈亏行(主键 wallet+date,补漏/重算安全覆盖)。net 内部算。
+
+        net = 奖励 + 返佣 + 卖出盈利 + Merge盈亏 − 亏损 − 手续费。merge_pnl 只累计
+        CONFIRMED 的 Merge(由 merge_events 表聚合而来,事件幂等)。旧签名调用
+        (无 merge_pnl)行为不变。"""
+        net = reward + rebate + sell_profit + merge_pnl - loss - fee
         c = self.conn.cursor()
         c.execute(
-            "INSERT INTO daily_pnl (wallet, date, reward, rebate, sell_profit, loss, fee, net)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO daily_pnl (wallet, date, reward, rebate, sell_profit, loss, fee, merge_pnl, net)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(wallet, date) DO UPDATE SET"
             " reward=excluded.reward, rebate=excluded.rebate, sell_profit=excluded.sell_profit,"
-            " loss=excluded.loss, fee=excluded.fee, net=excluded.net,"
-            " updated_at=strftime('%s','now')",
-            (wallet, date, reward, rebate, sell_profit, loss, fee, net),
+            " loss=excluded.loss, fee=excluded.fee, merge_pnl=excluded.merge_pnl,"
+            " net=excluded.net, updated_at=strftime('%s','now')",
+            (wallet, date, reward, rebate, sell_profit, loss, fee, merge_pnl, net),
         )
         self.conn.commit()
 
@@ -893,7 +1077,7 @@ class Database:
         """某钱包 [from_date, to_date] 的每日盈亏行,日期升序。"""
         c = self.conn.cursor()
         c.execute(
-            "SELECT date, reward, rebate, sell_profit, loss, fee, net FROM daily_pnl"
+            "SELECT date, reward, rebate, sell_profit, loss, fee, merge_pnl, net FROM daily_pnl"
             " WHERE wallet = ? AND date >= ? AND date <= ? ORDER BY date",
             (wallet, from_date, to_date),
         )
@@ -904,7 +1088,7 @@ class Database:
         c = self.conn.cursor()
         c.execute(
             "SELECT date, SUM(reward) reward, SUM(rebate) rebate, SUM(sell_profit) sell_profit,"
-            " SUM(loss) loss, SUM(fee) fee, SUM(net) net FROM daily_pnl"
+            " SUM(loss) loss, SUM(fee) fee, SUM(merge_pnl) merge_pnl, SUM(net) net FROM daily_pnl"
             " WHERE date >= ? AND date <= ? GROUP BY date ORDER BY date",
             (from_date, to_date),
         )

@@ -64,8 +64,13 @@ def plan_take_profit(
     return {"action": "replace", "price": want, "size": size, "cancel_ids": ids}
 
 
-def position_cost_with_lots(fills: list[dict], size: float):
+def position_cost_with_lots(fills: list[dict], size: float, merge_events: list = None):
     """当前持仓的加权成本 + 剩余逐笔持仓明细,严格由成交流(买入∪卖出)重建。
+
+    merge_events: 可选的 CONFIRMED Merge 事件列表(按确认时间正序,形如
+    {"amount": q})。Merge 在 CLOB 之外烧掉 YES+NO,get_trades 里没有对应成交 ——
+    重建时把每个事件按 FIFO 从最早的买入持仓里扣掉 q 份,剩余队列才是真实残仓。
+    不传/传空行为与原来完全一致;事件按 amount 消耗,幂等(同一事件只扣一次)。
 
     按 ts 正序回放我们在该 token 的全部成交:买入入 FIFO 队列,卖出从最早一笔开始
     抵消;回放完后队列里剩下的就是当前真实持仓,其加权均价即成本。已卖出的旧买单会被
@@ -95,6 +100,19 @@ def position_cost_with_lots(fills: list[dict], size: float):
             )
         elif side == "SELL":
             qty = fsize
+            while qty > 1e-9 and lots:
+                lot = lots[0]
+                take = min(lot["remaining"], qty)
+                lot["remaining"] -= take
+                qty -= take
+                if lot["remaining"] <= 1e-9:
+                    lots.pop(0)
+    # Merge 消耗:把已确认的整对回收当作库存消耗事件,按 FIFO 从最早买入扣起。
+    # 残差 FIFO 顺序保持正确(合并只消耗最老的份额),后续 CLOB 卖出从合并后的
+    # 队列继续 —— 否则重建数量与 Data API 实际持仓对不上,成本算不出、残仓裸奔。
+    if merge_events:
+        for ev in merge_events:
+            qty = float(ev.get("amount", 0) or 0)
             while qty > 1e-9 and lots:
                 lot = lots[0]
                 take = min(lot["remaining"], qty)

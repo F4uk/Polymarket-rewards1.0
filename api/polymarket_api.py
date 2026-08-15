@@ -2,6 +2,7 @@
 
 import functools
 import logging
+import os
 import time
 from py_clob_client_v2.client import ClobClient
 from py_clob_client_v2.clob_types import (
@@ -51,6 +52,11 @@ _BOOKS_BATCH_SIZE = 100
 # Rewards API is part of the CLOB API
 REWARDS_API = POLYMARKET_HOST
 DATA_API_HOST = "https://data-api.polymarket.com"
+
+
+class RelayerNotConfigured(Exception):
+    """Merge 所需的官方 Relayer 凭证缺失(环境变量未配置)。调用方应降级:Maker /
+    Protected FAK 照常,Merge 路由不可用。"""
 
 
 class OrderRejected(Exception):
@@ -364,6 +370,8 @@ class PolymarketAPI:
         size: int,
         tick_size: str = "0.01",
         neg_risk: bool | None = None,
+        order_type: str = OrderType.GTC,
+        post_only: bool = False,
     ) -> dict:
         """Place a limit sell order at specified price.
 
@@ -372,6 +380,9 @@ class PolymarketAPI:
         know the position's neg_risk, so it relies on this auto-resolution — a
         hardcoded False here silently broke every sell on negative-risk markets
         (position couldn't be sold at all, 2026-06-02 incident).
+
+        ``order_type``/``post_only`` 供快速退出路由用(默认 GTC/False 与既有行为一致;
+        post_only=True 时若会吃单,CLOB 拒绝 -> 路由下 tick 重算,绝不压价追单)。
 
         Returns dict with "orderID" and "status" keys.
         """
@@ -385,7 +396,9 @@ class PolymarketAPI:
             tick_size=tick_size,
             neg_risk=neg_risk,
         )
-        res = self.client.create_and_post_order(order_args, options, OrderType.GTC)
+        res = self.client.create_and_post_order(
+            order_args, options, order_type, post_only=post_only
+        )
         return _check_order_resp(res, "限价卖单")
 
     def place_market_sell(
@@ -446,6 +459,136 @@ class PolymarketAPI:
         )
         res = self.client.create_and_post_order(order_args, options, OrderType.FAK)
         return _check_order_resp(res, "限价扫单(FAK)")
+
+    def place_fok_buy(
+        self,
+        token_id: str,
+        price: float,
+        size: int,
+        tick_size: str = "0.01",
+        neg_risk: bool | None = None,
+    ) -> dict:
+        """Exact-q FOK 限价买单(补对专用):全量成交或全部不成交,绝不挂簿。
+
+        与市价单不同,限价单的 size 是精确份额(市价 BUY 的 amount 是美元数,份额
+        由服务端按盘口折算,无法保证补对恰好 q 份)。FOK 全成或全不成:成交不足时
+        CLOB 返回 unmatched 并由 _check_order_resp 抛 OrderRejected。delayed 表示
+        已受理未确认,调用方须持久化 orderID 并对账,不得重复提交。``neg_risk=None``
+        走客户端自动解析(与既有下单一致)。
+        """
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=float(size),
+            side="BUY",
+        )
+        options = PartialCreateOrderOptions(
+            tick_size=tick_size,
+            neg_risk=neg_risk,
+        )
+        res = self.client.create_and_post_order(order_args, options, OrderType.FOK)
+        return _check_order_resp(res, "FOK 补对买单")
+
+    def get_neg_risk(self, token_id: str) -> bool:
+        """该 token 所在市场是否负风险(客户端内部缓存,只首次触网)。"""
+        return bool(self.client.get_neg_risk(token_id))
+
+    def _relayer_client(self):
+        """官方 Builder Relayer 客户端(凭证只从环境变量读取,绝不落库/落日志)。
+
+        凭证: POLY_BUILDER_API_KEY / POLY_BUILDER_SECRET / POLY_BUILDER_PASSPHRASE
+        (可加 POLY_RELAYER_URL 覆盖默认官方端点)。缺失抛 RelayerNotConfigured。
+        """
+        from py_builder_relayer_client.client import RelayClient
+        from py_builder_signing_sdk.config import BuilderConfig
+        from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
+        from api.proxy import install_relayer_proxy
+
+        install_relayer_proxy()  # 幂等:Relayer 流量走本钱包代理(绝不静默直连)
+        url = os.environ.get("POLY_RELAYER_URL") or "https://relayer-v2.polymarket.com"
+        key = os.environ.get("POLY_BUILDER_API_KEY")
+        secret = os.environ.get("POLY_BUILDER_SECRET")
+        passphrase = os.environ.get("POLY_BUILDER_PASSPHRASE")
+        if not (key and secret and passphrase):
+            raise RelayerNotConfigured(
+                "缺少 POLY_BUILDER_API_KEY/SECRET/PASSPHRASE 环境变量, Merge 路由不可用"
+            )
+        cfg = BuilderConfig(
+            local_builder_creds=BuilderApiKeyCreds(key=key, secret=secret, passphrase=passphrase)
+        )
+        return RelayClient(url, CHAIN_ID, self.private_key, cfg)
+
+    def is_merge_adapter_approved(self, funder: str, neg_risk: bool) -> bool:
+        """CTF isApprovedForAll(funder, mergeAdapter) 链上只读查询(走钱包代理 RPC)。"""
+        from engine.merge import (
+            CTF,
+            is_approved_for_all_calldata,
+            parse_is_approved_result,
+        )
+
+        result = self._rpc_eth_call(CTF, is_approved_for_all_calldata(funder, neg_risk))
+        return parse_is_approved_result(result)
+
+    def _rpc_eth_call(self, to: str, data: str) -> str:
+        """只读 eth_call(经钱包代理);失败抛。仅用于授权检查等只读链上查询。"""
+        import os as _os
+
+        from api.proxy import http_post
+
+        rpc = _os.environ.get("POLY_RPC_URL") or "https://polygon.drpc.org"
+        resp = http_post(
+            rpc,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_call",
+                "params": [{"to": to, "data": data}, "latest"],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if body.get("error"):
+            raise RuntimeError(f"eth_call 失败: {body['error']}")
+        return body.get("result", "")
+
+    def merge_positions(
+        self,
+        condition_id: str,
+        amount: float,
+        neg_risk: bool,
+        approval_batch: bool = False,
+    ) -> dict:
+        """经官方 Relayer 提交 Merge(烧 equal YES+NO -> pUSD)。
+
+        approval_batch=True 时先把 CTF.setApprovalForAll(adapter) 与 Merge 放进同一
+        批 Safe 交易(顺序执行,授权先于 Merge)。返回 {"transaction_id", "transaction_hash"};
+        只有拿到 transaction_id 才算提交过(调用方据此绝不重复提交)。异常消息不含凭证。
+        """
+        from engine.merge import (
+            build_adapter_approval_transaction,
+            build_merge_transaction,
+        )
+        from py_builder_relayer_client.models import Transaction
+
+        txs = []
+        if approval_batch:
+            a = build_adapter_approval_transaction(neg_risk)
+            txs.append(Transaction(to=a["to"], data=a["data"], value="0"))
+        m = build_merge_transaction(condition_id, amount, neg_risk)
+        txs.append(Transaction(to=m["to"], data=m["data"], value="0"))
+        client = self._relayer_client()
+        resp = client.execute(txs, metadata=f"merge-{str(condition_id)[:12]}")
+        return {
+            "transaction_id": getattr(resp, "transaction_id", None),
+            "transaction_hash": getattr(resp, "transaction_hash", None),
+        }
+
+    def get_merge_transaction_state(self, transaction_id: str) -> list:
+        """Relayer 交易状态行列表(元素含 state/transactionHash)。失败抛。"""
+        client = self._relayer_client()
+        rows = client.get_transaction(transaction_id)
+        return rows if isinstance(rows, list) else []
 
     # --- Order Management ---
 
@@ -827,6 +970,12 @@ _PROXIED_METHODS = (
     "are_orders_scoring",
     "get_user_positions",
     "get_activity",
+    "place_fok_buy",
+    "get_neg_risk",
+    "is_merge_adapter_approved",
+    "merge_positions",
+    "get_merge_transaction_state",
+    "_rpc_eth_call",
 )
 for _name in _PROXIED_METHODS:
     setattr(PolymarketAPI, _name, _proxied(getattr(PolymarketAPI, _name)))

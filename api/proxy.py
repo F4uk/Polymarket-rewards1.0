@@ -280,3 +280,39 @@ def probe_proxy(raw, *, timeout=8) -> tuple[str, str | None]:
             continue
         return cand, _exit_ip(url, timeout)
     raise ProxyUnreachable("代理连不上(HTTP / SOCKS5 都试过)")
+
+# --- Relayer 客户端代理注入(与 CLOB 同一套 current_proxy 选路) ---
+# py-builder-relayer-client 的 HTTP 层是模块级 requests.request,不支持 per-instance
+# 代理。与 install_clob_proxy 同理:替换其 helpers.request 为按 current_proxy 注入
+# proxies 的版本。绝不静默直连:钱包配了代理时 Relayer 流量必须走该代理,否则泄露
+# 真实 IP;代理不可用时按 _CONNECT_ERRORS 退避重试,仍失败则上抛(调用方降级)。
+
+_RELAYER_PATCHED = False
+
+
+def install_relayer_proxy():
+    """幂等:让官方 relayer 客户端的全部请求走 current_proxy 选路。"""
+    global _RELAYER_PATCHED
+    if _RELAYER_PATCHED:
+        return
+    try:
+        import py_builder_relayer_client.http_helpers.helpers as rh
+
+        orig = rh.request
+
+        def _relayer_request(endpoint, method="GET", headers=None, data=None):
+            proxy = current_proxy.get()
+
+            def _do():
+                kw = {}
+                if proxy:
+                    kw["proxies"] = {"http": proxy, "https": proxy}
+                return orig(endpoint, method=method, headers=headers, data=data, **kw)
+
+            return _retry_on_connect_error(_do, attempts=2, backoff=0.3)
+
+        rh.request = _relayer_request
+        _RELAYER_PATCHED = True
+    except Exception:
+        # 包没装/装坏:让 Relayer 调用自然失败,由上层降级,绝不静默直连。
+        _RELAYER_PATCHED = True

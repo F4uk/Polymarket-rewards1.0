@@ -13,13 +13,13 @@
         <svg id="pnl-chart" viewBox="0 0 900 300" style="width:100%;height:300px;display:block"></svg>
         <div id="pnl-tip" style="display:none;position:absolute;pointer-events:none;background:rgba(0,0,0,.78);color:#fff;padding:6px 8px;border-radius:4px;font-size:12px;white-space:nowrap"></div>
     </div>
-    <p class="hint" style="color:#888;font-size:12px"><span style="color:#4a90d9">━ 累计净利润</span>。净利润 = 做市奖励 + 做市返佣 + 卖出盈利 − 亏损 − taker手续费。转入转出不计入。</p>
+    <p class="hint" style="color:#888;font-size:12px"><span style="color:#4a90d9">━ 累计净利润</span>。净利润 = 做市奖励 + 做市返佣 + 卖出盈利 + Merge盈亏 − 亏损 − taker手续费。Merge盈亏只计已确认(链上)的整对回收,转入转出不计入。</p>
 
     <div id="pnl-empty" class="hint" style="display:none;color:#888">暂无盈亏记录：启动引擎后自动从 2026-06-01 补齐。</div>
 
     <table class="data-table" id="pnl-table" style="margin-top:8px">
         <thead>
-            <tr><th>日期</th><th>做市奖励</th><th>做市返佣</th><th>卖出盈利</th><th>亏损</th><th>手续费</th><th>净利润</th></tr>
+            <tr><th>日期</th><th>做市奖励</th><th>做市返佣</th><th>卖出盈利</th><th>Merge盈亏</th><th>亏损</th><th>手续费</th><th>净利润</th></tr>
         </thead>
         <tbody id="pnl-body"></tbody>
     </table>
@@ -28,8 +28,8 @@
 
 {% block scripts %}
 <script>
-const PNL_COLS = ['reward', 'rebate', 'sell_profit', 'loss', 'fee', 'net'];
-const PNL_LABELS = {reward: '做市奖励', rebate: '做市返佣', sell_profit: '卖出盈利', loss: '亏损', fee: '手续费', net: '净利润'};
+const PNL_COLS = ['reward', 'rebate', 'sell_profit', 'merge_pnl', 'loss', 'fee', 'net'];
+const PNL_LABELS = {reward: '做市奖励', rebate: '做市返佣', sell_profit: '卖出盈利', merge_pnl: 'Merge盈亏', loss: '亏损', fee: '手续费', net: '净利润'};
 
 function money(v) { return (v == null ? 0 : v).toFixed(2); }
 function netColor(v) { return v > 1e-9 ? '#3aa66a' : (v < -1e-9 ? '#d24b4b' : '#888'); }
@@ -55,7 +55,7 @@ function renderTotals(t) {
         const v = t[k] || 0;
         const color = k === 'net' ? netColor(v)
             : (k === 'loss' || k === 'fee' ? '#d24b4b'
-            : (k === 'sell_profit' ? '#3aa66a' : '#333'));
+            : (k === 'sell_profit' || k === 'merge_pnl' ? '#3aa66a' : '#333'));
         return `<div style="min-width:110px;padding:8px 12px;border:1px solid #8883;border-radius:6px">
             <div style="font-size:12px;color:#888">${PNL_LABELS[k]}</div>
             <div style="font-size:18px;font-weight:600;color:${color}">${money(v)}</div></div>`;
@@ -72,6 +72,7 @@ function renderTable(series) {
             <td>${money(s.reward)}</td>
             <td>${money(s.rebate)}</td>
             <td style="color:#3aa66a">${money(s.sell_profit)}</td>
+            <td style="color:${netColor(s.merge_pnl)}">${money(s.merge_pnl)}</td>
             <td style="color:#d24b4b">${money(s.loss)}</td>
             <td style="color:#d24b4b">${money(s.fee)}</td>
             <td style="color:${netColor(s.net)};font-weight:600">${money(s.net)}</td>
@@ -122,7 +123,7 @@ function drawPnlChart(series, cum) {
         const c = el('circle', {cx: x(i), cy: y(cum[i]), r: 4, fill: '#4a90d9', opacity: 0});
         c.addEventListener('mouseenter', ev => {
             c.setAttribute('opacity', 1);
-            tip.innerHTML = `${p.date}<br>累计净利润 ${money(cum[i])}<br>当日净 ${money(p.net)}（奖励 ${money(p.reward)} 返佣 ${money(p.rebate)} 盈 ${money(p.sell_profit)} 亏 ${money(p.loss)} 费 ${money(p.fee)}）`;
+            tip.innerHTML = `${p.date}<br>累计净利润 ${money(cum[i])}<br>当日净 ${money(p.net)}（奖励 ${money(p.reward)} 返佣 ${money(p.rebate)} 盈 ${money(p.sell_profit)} Merge ${money(p.merge_pnl)} 亏 ${money(p.loss)} 费 ${money(p.fee)}）`;
             tip.style.display = '';
             const box = wrap.getBoundingClientRect();
             tip.style.left = Math.min(ev.clientX - box.left + 12, box.width - 250) + 'px';

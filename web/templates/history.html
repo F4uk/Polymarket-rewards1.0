@@ -42,6 +42,51 @@
     <span id="page-info" style="margin:0 10px"></span>
     <button class="btn btn-sm" id="next-page" onclick="nextPage()">下一页</button>
 </div>
+
+<h2 style="margin-top:24px">Merge记录</h2>
+<p class="metric-note">YES+NO 整对回收:PAIR=已有整对直接合并;FOK_MERGE=先 FOK 补对再合并。只有「确认」状态计入盈亏。</p>
+<div class="filter-bar">
+    <label>钱包：</label>
+    <select id="merge-wallet-filter" onchange="reloadMerge()">
+        <option value="">全部</option>
+    </select>
+    <label>状态：</label>
+    <select id="merge-status-filter" onchange="reloadMerge()">
+        <option value="">全部</option>
+        <option value="READY">READY(预留/补对中)</option>
+        <option value="SUBMITTED">SUBMITTED(已提交)</option>
+        <option value="CONFIRMED">CONFIRMED(已确认)</option>
+        <option value="FAILED">FAILED(失败)</option>
+    </select>
+    <label>开始日期：</label>
+    <input type="date" id="merge-start-date" onchange="reloadMerge()">
+    <label>结束日期：</label>
+    <input type="date" id="merge-end-date" onchange="reloadMerge()">
+    <button class="btn btn-sm" onclick="reloadMerge()">刷新</button>
+</div>
+<div class="table-scroll">
+<table class="data-table" style="table-layout:fixed;width:100%">
+    <colgroup>
+        <col style="width:11%"><col style="width:7%"><col style="width:12%"><col style="width:8%">
+        <col style="width:6%"><col style="width:6%"><col style="width:6%"><col style="width:6%">
+        <col style="width:7%"><col style="width:9%"><col style="width:8%"><col style="width:7%">
+        <col style="width:7%">
+    </colgroup>
+    <thead>
+        <tr>
+            <th>时间</th><th>钱包</th><th>市场</th><th>路线</th><th>数量</th>
+            <th>YES成本</th><th>NO成本</th><th>回收</th><th>Merge盈亏</th><th>状态</th>
+            <th>FOK订单</th><th>Relayer TX</th><th>失败原因</th>
+        </tr>
+    </thead>
+    <tbody id="merge-body"></tbody>
+</table>
+</div>
+<div class="pager" id="merge-pager" style="margin-top:10px;display:none">
+    <button class="btn btn-sm" id="merge-prev-page" onclick="prevMergePage()">上一页</button>
+    <span id="merge-page-info" style="margin:0 10px"></span>
+    <button class="btn btn-sm" id="merge-next-page" onclick="nextMergePage()">下一页</button>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -60,6 +105,16 @@ const ACTION_LABELS = {
     exit_recancel: '离场撤旧改一笔',
     exit_cancel_sell: '清仓前撤卖单',
     exit_market: '市价离场(止盈/止损)',
+    exit_maker: '快速退出·挂Maker卖',
+    exit_maker_filled: '快速退出·Maker成交平仓',
+    exit_protected_fak: '快速退出·受保护FAK',
+    exit_protected_fak_partial: '快速退出·FAK部分成交',
+    merge_pair_ready: 'Merge·预留Pair',
+    merge_fok_submit: 'Merge·FOK补对提交',
+    merge_fok_matched: 'Merge·FOK补对成交',
+    merge_submit: 'Merge·提交Relayer',
+    merge_confirmed: 'Merge·确认',
+    merge_failed: 'Merge·失败',
     cancel_remainder: '撤成交剩余',
     step3_cancel_outofband: '复查撤单(盘口越界)',
     price_band_cancel: '复查撤单(价超区间)',
@@ -137,5 +192,69 @@ function refreshActions() {
 
 // 先等备注映射就绪再首渲染,否则表格会先闪一遍短地址再变备注。
 fillWalletSelect(document.getElementById('wallet-filter')).then(refreshActions);
+
+// ---- Merge 记录 ----
+const MERGE_ROUTE_LABELS = {PAIR: 'Pair 合并', FOK_MERGE: 'FOK补对+合并'};
+const MERGE_STATUS_LABELS = {
+    READY: '<span class="badge muted">READY</span>',
+    SUBMITTED: '<span class="badge warn">SUBMITTED</span>',
+    CONFIRMED: '<span class="badge ok">CONFIRMED</span>',
+    FAILED: '<span class="badge no">FAILED</span>',
+};
+const MERGE_PAGE_SIZE = 50;
+let mergePage = 1, mergeTotalPages = 1;
+
+function reloadMerge() { mergePage = 1; refreshMerge(); }
+function prevMergePage() { if (mergePage > 1) { mergePage--; refreshMerge(); } }
+function nextMergePage() { if (mergePage < mergeTotalPages) { mergePage++; refreshMerge(); } }
+
+function refreshMerge() {
+    const wallet = document.getElementById('merge-wallet-filter').value;
+    const status = document.getElementById('merge-status-filter').value;
+    const s = document.getElementById('merge-start-date').value;
+    const e = document.getElementById('merge-end-date').value;
+    const params = new URLSearchParams();
+    if (wallet) params.set('wallet', wallet);
+    if (status) params.set('status', status);
+    if (s) params.set('start', new Date(s).getTime() / 1000);
+    if (e) params.set('end', new Date(e + 'T23:59:59').getTime() / 1000);
+    params.set('page', mergePage);
+    params.set('page_size', MERGE_PAGE_SIZE);
+    fetch(`/api/merge-events?${params}`).then(r => r.json()).then(data => {
+        const rows = data.rows || [];
+        const total = data.total || 0;
+        mergeTotalPages = Math.max(1, Math.ceil(total / MERGE_PAGE_SIZE));
+        const body = document.getElementById('merge-body');
+        const pager = document.getElementById('merge-pager');
+        if (!total) {
+            body.innerHTML = '<tr><td colspan="13">暂无 Merge 记录</td></tr>';
+            pager.style.display = 'none';
+            return;
+        }
+        body.innerHTML = rows.map(m => `
+            <tr>
+                <td>${escapeHtml(new Date(m.created_at * 1000).toLocaleString('zh-CN'))}</td>
+                <td title="${escapeHtml(m.wallet)}">${escapeHtml(walletLabelOf(m.wallet))}</td>
+                <td>${marketCell(m.market_name, m.condition_id, m.market_url)}</td>
+                <td>${MERGE_ROUTE_LABELS[m.route] || escapeHtml(m.route)}</td>
+                <td>${escapeHtml(m.amount)}</td>
+                <td>${m.yes_cost ? m.yes_cost.toFixed(4) : '-'}</td>
+                <td>${m.no_cost ? m.no_cost.toFixed(4) : '-'}</td>
+                <td>${m.recovered_usd ? m.recovered_usd.toFixed(2) : '-'}</td>
+                <td class="${(m.realized_pnl||0)>=0?'profit':'loss'}">${m.realized_pnl ? m.realized_pnl.toFixed(2) : '-'}</td>
+                <td>${MERGE_STATUS_LABELS[m.status] || escapeHtml(m.status)}</td>
+                <td title="${escapeHtml(m.complement_order_id)}">${m.complement_order_id ? shortAddr(m.complement_order_id) : '-'}</td>
+                <td title="${escapeHtml(m.relayer_tx_id)}">${m.relayer_tx_id ? shortAddr(m.relayer_tx_id) : '-'}</td>
+                <td>${escapeHtml(m.error_message)}</td>
+            </tr>`).join('');
+        pager.style.display = '';
+        document.getElementById('merge-page-info').textContent =
+            `第 ${mergePage} / ${mergeTotalPages} 页（共 ${total} 条）`;
+        document.getElementById('merge-prev-page').disabled = mergePage <= 1;
+        document.getElementById('merge-next-page').disabled = mergePage >= mergeTotalPages;
+    });
+}
+
+fillWalletSelect(document.getElementById('merge-wallet-filter')).then(refreshMerge);
 </script>
 {% endblock %}

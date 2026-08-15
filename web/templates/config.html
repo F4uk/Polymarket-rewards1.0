@@ -204,6 +204,40 @@
         <button type="button" class="btn" onclick="addTierCard()">+ 添加档位</button>
         <p class="hint" style="color:#888;font-size:12px">每个模块只对「最低奖励份额 = 档位值」的市场生效：勾选启用、设挂单份数（≥档位值）和该档的选档参数。没有任何已启用模块能对上的市场<b>不会挂单</b>。金额数值表按档配置：价格档[美分]→数值，价超表的档不挂。</p>
 
+        <h3>快速退出 / Merge</h3>
+        <p class="hint" style="color:#888;font-size:12px">Reward BUY 成交后:已有 YES+NO 整对先 <b>Pair Merge</b> 回收抵押品;单侧先短 <b>Maker 卖</b>(等待截止 = 最老一笔在持买入 + 等待秒数,重启/部分成交不重置),超时或触发上方止损阈值后比价:<b>FOK 补对+Merge</b> vs <b>受保护 FAK 卖出</b>,执行回收更优的路线。FAK 带最坏价保护,绝不成交低于保护价;部分成交的残差下个监控周期再处理。实际持仓余额永远优先于本地记录。</p>
+        <div class="form-grid">
+            <div class="form-group">
+                <label>Maker 等待秒数 (0=不等,直接比价)</label>
+                <input type="number" name="exit_maker_wait_sec" step="1" min="0">
+                <span class="hint">60 秒内先尝试挂卖一做 Maker;到期仍未成交再走比价路由。止损阈值命中会立即跳过这段等待。</span>
+            </div>
+            <div class="form-group">
+                <label><input type="checkbox" id="merge-enabled" style="width:auto;flex:none"> 启用 Merge(需 Relayer 凭证)</label>
+                <span class="hint">合并整对 YES+NO 换回 1:1 抵押品。仅在链上/Relayer 确认后计入盈亏;凭证缺失时 Maker/FAK 照常,只是不合并。</span>
+            </div>
+            <div class="form-group">
+                <label>最小 Merge 份数</label>
+                <input type="number" name="merge_min_shares" step="1" min="1">
+                <span class="hint">整对份数低于此值不合并,两侧各自走 Maker/FAK。</span>
+            </div>
+            <div class="form-group">
+                <label>最小 Merge 优势 (USD)</label>
+                <input type="number" name="merge_min_advantage_usd" step="0.01" min="0">
+                <span class="hint">FOK 补对+Merge 的期望回收必须比直接 FAK 至少多出这个数才选它;FOK 最坏价按此动态推导,无固定上限。</span>
+            </div>
+            <div class="form-group">
+                <label>Merge 确认超时 (秒)</label>
+                <input type="number" name="merge_confirm_timeout_sec" step="10" min="30">
+                <span class="hint">Relayer 提交后在此窗口内轮询链上状态;超时未决放慢轮询,绝不重复提交。</span>
+            </div>
+            <div class="form-group">
+                <label>Relayer 凭证</label>
+                <span id="relayer-status" class="hint">检测中…</span>
+                <span class="hint">凭证只从环境变量读取(POLY_BUILDER_API_KEY / POLY_BUILDER_SECRET / POLY_BUILDER_PASSPHRASE),不落库、不显示、不进日志。</span>
+            </div>
+        </div>
+
         <button type="submit" class="btn btn-primary">保存策略参数</button>
     </form>
 </section>
@@ -399,6 +433,8 @@ function loadStrategy(tid) {
         // checkbox 不能靠上面的 input.value 回填（那只会设 value 属性，不动 checked）
         const skipNew = document.getElementById('skip-new-markets');
         if (skipNew) skipNew.checked = !!data.skip_new_markets;
+        const mergeEn = document.getElementById('merge-enabled');
+        if (mergeEn) mergeEn.checked = !!data.merge_enabled;
         updateSkipNewCol();
         updateStopMode();
         updatePlacementMode();
@@ -619,6 +655,7 @@ document.getElementById('strategy-form').addEventListener('submit', function(e) 
     data.order_size_mode = (document.getElementById('order-size-mode') || {}).value || 'min';
     // checkbox 同 select，不在 input[type=number] 里，单独收。
     data.skip_new_markets = !!(document.getElementById('skip-new-markets') || {}).checked;
+    data.merge_enabled = !!(document.getElementById('merge-enabled') || {}).checked;
     // 小时数留空 -> parseFloat('')=NaN，归 0（= 不筛），别让 NaN 变成 JSON null。
     if (isNaN(data.new_market_hours)) data.new_market_hours = 0;
     const st = serializeTiers();
@@ -907,5 +944,13 @@ function toggleWallet(address, enabled) {
 
 loadTemplates().then(() => { loadStrategy(currentTemplateId); loadWallets(); });
 loadEngine();
+// Relayer 凭证状态(只显示 已配置/未配置,绝不显示密钥本身)。
+fetch('/api/relayer/status').then(r => r.json()).then(d => {
+    const el = document.getElementById('relayer-status');
+    if (el) el.textContent = d.configured ? 'Relayer: 已配置' : 'Relayer: 未配置';
+}).catch(() => {
+    const el = document.getElementById('relayer-status');
+    if (el) el.textContent = 'Relayer: 状态未知';
+});
 </script>
 {% endblock %}

@@ -26,6 +26,7 @@ from models.database import Database
 from engine.manager import EngineManager
 from utils.crypto import derive_key, encrypt, decrypt
 from engine.monitor_status import get_snapshot
+from engine import exit_status
 from engine.market_links import enrich_with_market_meta, ensure_market_meta
 from engine.blacklist_ops import buy_order_ids_for_condition
 from engine.take_profit import effective_theta_stop
@@ -1056,6 +1057,10 @@ def api_get_positions():
                             max(0.0, avg - eff) if eff is not None else None
                         ),
                         "pnl": (cur - avg) * size,
+                        # 快速退出状态(路由每 tick 算好的轻量快照,UI 不再重复请求盘口)。
+                        "exit_status": exit_status.get_status(
+                            p.get("asset", ""), p.get("conditionId", "")
+                        ),
                     }
                 )
         except Exception as e:
@@ -1402,7 +1407,7 @@ def api_pnl():
         series = db.get_daily_pnl_all(from_date, to_date)
     else:
         series = db.get_daily_pnl(wallet, from_date, to_date)
-    keys = ("reward", "rebate", "sell_profit", "loss", "fee", "net")
+    keys = ("reward", "rebate", "sell_profit", "merge_pnl", "loss", "fee", "net")
     totals = {k: round(sum(s[k] for s in series), 6) for k in keys}
     cum = 0.0
     cumulative_net = []
@@ -1497,7 +1502,59 @@ def api_dashboard():
             "total_orders": total_orders,
             "total_positions": total_positions,
             "total_pnl": total_pnl,
+            # 退出处理中:快速退出路由每 tick 发布的轻量快照(Maker 退出 + Merge 活动操作)。
+            "exits_pending": exit_status.count_active(),
             "wallets": wallet_summaries,
             "templates_without_tiers": templates_without_tiers,
         }
+    )
+
+
+# --- API: Relayer 凭证状态(只显示已配置/未配置,绝不返回密钥) ---
+
+
+@app.route("/api/relayer/status", methods=["GET"])
+@login_required
+def api_relayer_status():
+    import os
+
+    configured = bool(
+        os.environ.get("POLY_BUILDER_API_KEY")
+        and os.environ.get("POLY_BUILDER_SECRET")
+        and os.environ.get("POLY_BUILDER_PASSPHRASE")
+    )
+    return jsonify({"configured": configured})
+
+
+# --- API: Merge 记录(快速退出) ---
+
+
+@app.route("/api/merge-events", methods=["GET"])
+@login_required
+def api_get_merge_events():
+    """Merge 记录分页查询:wallet/status/start/end/分页,复用市场元数据富化。
+
+    只返回本地记录(无任何凭证/私钥字段);状态筛选支持逗号分隔多个。
+    """
+    wallet = (request.args.get("wallet") or "").strip() or None
+    statuses = request.args.get("status")
+    status_list = (
+        [s.strip() for s in statuses.split(",") if s.strip()] if statuses else None
+    )
+    start = request.args.get("start", type=float)
+    end = request.args.get("end", type=float)
+    page = max(1, request.args.get("page", default=1, type=int) or 1)
+    page_size = request.args.get("page_size", default=50, type=int) or 50
+    page_size = min(200, max(1, page_size))
+    rows, total = db.list_merge_events(
+        wallet=wallet,
+        statuses=status_list,
+        start=start,
+        end=end,
+        limit=page_size,
+        offset=(page - 1) * page_size,
+    )
+    _enrich_rows(rows, "condition_id")
+    return jsonify(
+        {"rows": rows, "total": total, "page": page, "page_size": page_size}
     )

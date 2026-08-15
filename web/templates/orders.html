@@ -45,7 +45,7 @@
 <div class="table-scroll">
 <table class="data-table">
   <thead><tr><th>钱包</th><th>市场</th><th>方向</th><th>成本价</th><th>数量</th><th>现价</th>
-  <th>止损价</th><th>浮动盈亏</th></tr></thead>
+  <th>止损价</th><th>浮动盈亏</th><th>退出状态</th></tr></thead>
   <tbody id="positions-body"></tbody>
 </table>
 </div>
@@ -76,7 +76,8 @@ function refreshOrders(){
       <td>${p.size!=null?p.size:'-'}</td>
       <td>${p.current_price!=null?p.current_price.toFixed(4):'-'}</td>
       <td>${p.stop_price!=null?p.stop_price.toFixed(4):'-'}</td>
-      <td class="${(p.pnl||0)>=0?'profit':'loss'}">${(p.pnl||0).toFixed(2)}</td></tr>`).join('');
+      <td class="${(p.pnl||0)>=0?'profit':'loss'}">${(p.pnl||0).toFixed(2)}</td>
+      <td title="快速退出:Maker 等待 / FOK 补对 / Merge / Protected FAK">${escapeHtml(p.exit_status||'—')}</td></tr>`).join('');
   });
 }
 

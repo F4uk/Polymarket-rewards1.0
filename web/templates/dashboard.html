@@ -28,6 +28,7 @@
     <div class="stat-card"><h3>总持仓</h3><div class="v" id="total-positions">-</div></div>
     <div class="stat-card"><h3>总盈亏</h3><div class="v" id="total-pnl">-</div></div>
     <div class="stat-card"><h3>合格市场</h3><div class="v" id="eligible-count">-</div></div>
+    <div class="stat-card"><h3>退出处理中</h3><div class="v" id="exits-pending">-</div></div>
 </div>
 
 <h2>钱包状态</h2>
@@ -63,6 +64,7 @@ function refreshDashboard() {
         document.getElementById('total-orders').textContent = data.total_orders;
         document.getElementById('total-positions').textContent = data.total_positions;
         document.getElementById('total-pnl').textContent = (data.total_pnl || 0).toFixed(2) + ' pUSD';
+        document.getElementById('exits-pending').textContent = data.exits_pending ?? 0;
         const engineRunning = (data.wallets || []).some(w => w.running);
         document.getElementById('engine-status').innerHTML =
             `<span class="status ${engineRunning ? 'running' : 'stopped'}">${engineRunning ? '运行中' : '已停止'}</span>`;

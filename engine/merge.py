@@ -5,7 +5,7 @@
 - CTF Collateral Adapter(标准市场) 0xAdA100Db00Ca00073811820692005400218FcE1f
   mergePositions(pUSD, bytes32(0), conditionId, [1,2], amount) —— 烧 YES+NO,
   原子地把回收的 USDC.e wrap 成 pUSD 打回调用者。
-- NegRiskCtfCollateralAdapter(负风险市场) 0xAdA200001000ef00D07553cEE7006808F895c6F1
+- NegRiskCtfCollateralAdapter(负风险市场) 0xadA2005600Dec949baf300f4C6120000bDB6eAab
   同样的接口,内部走 NegRiskAdapter.mergePositions(conditionId, amount)。
 - 授权:两个 adapter 都经 CTF.safeBatchTransferFrom 从调用者拉走 YES/NO,因此
   调用者(我们的 Safe)须先在 CTF 上 setApprovalForAll(adapter, true)。
@@ -21,7 +21,7 @@ from eth_utils import to_hex
 # --- Polygon 主网官方合约(已链上核实) ---
 CTF = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"  # 条件代币框架
 CTF_COLLATERAL_ADAPTER = "0xAdA100Db00Ca00073811820692005400218FcE1f"  # 标准市场
-NEG_RISK_COLLATERAL_ADAPTER = "0xAdA200001000ef00D07553cEE7006808F895c6F1"  # 负风险市场
+NEG_RISK_COLLATERAL_ADAPTER = "0xadA2005600Dec949baf300f4C6120000bDB6eAab"  # 负风险市场
 PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"  # Polymarket USD(CLOB 抵押品)
 USDCE = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # 桥接 USDC(CTF 底层抵押品)
 

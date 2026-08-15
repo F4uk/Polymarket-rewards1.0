@@ -13,6 +13,7 @@ import pytest
 from engine.inventory_exit import InventoryExitEngine
 from engine.manager import WalletWorker
 from engine.monitor import OrderMonitor
+from engine.positions import condition_key
 from models.database import ActiveExitCycleExists, Database
 
 
@@ -2062,3 +2063,202 @@ def test_fix3_check_merges_pure_bot_merges(tmp_path, merge_env):
     with patch.object(monitor, "_merge_client", return_value=client):
         monitor.check_merges(lambda cid: __import__("threading").Lock())
     client.submit_merge.assert_called_once_with("0xFunder", CID, 20.0)
+
+
+# ---------------------------------------------------------------------------
+# Fix pack 4 regressions (true fresh trades at funds-mutation boundaries)
+# ---------------------------------------------------------------------------
+
+
+def _monitor_engine(db, api):
+    """Production architecture: the engine wired to OrderMonitor's injected
+    trades provider (monitor._engine_trades), whose _trades_by_cid we can
+    intentionally stale."""
+    monitor = OrderMonitor(api, db, "0xW")
+    eng = monitor._inventory_exit()
+    # tests never probe a real Relayer: readiness is injected as READY
+    eng._readiness_checker = lambda: (True, "READY")
+    eng._readiness_cache = (0.0, True, "")
+    return monitor, eng
+
+
+def test_fix4_stale_prefetch_direct_no_manual_sale(tmp_path):
+    db = _db(tmp_path, _template_fast(maker_exit_wait_sec=0))
+    api = FakeAPI(
+        positions=[_pos("NO", 50, "no")],
+        books={
+            "no": _book([(0.28, 100)], [(0.30, 100)]),
+            "yes": _book([], [(0.78, 100)]),
+        },
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    db.record_bot_buy_order("0xW", "o-bot", CID, "no")
+    api._bot_fills[CID] = [
+        _sell_fill("no", 20, 0.30, ts=1, side="BUY", order_id="o-bot")
+    ]
+    # fresh CLOB: the bot SELL 20 is already confirmed
+    api._trades[CID] = [_sell_fill("no", 20, 0.28, ts=time.time() + 5)]
+    monitor, eng = _monitor_engine(db, api)
+    # intentionally STALE prefetch: bot BUY NO20 only (no SELL yet)
+    monitor._trades_by_cid[CID] = [
+        _sell_fill("no", 20, 0.30, ts=1, side="BUY", order_id="o-bot")
+    ]
+    # Data API intentionally lags: wallet still shows NO50 (manual NO30 + stale NO20)
+    eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
+    # preview sees stale managed 20 -> DIRECT; the pre-mutation TRUE fresh read
+    # sees managed 0 -> no FAK, no manual inventory sold
+    assert api._placed_market_sells == []
+    cycle = db.get_active_exit_cycle("0xW", CID)
+    assert cycle is not None
+
+
+def test_fix4_stale_prefetch_maker_reprice_no_replacement(tmp_path):
+    db = _db(tmp_path, _template_fast())
+    api = FakeAPI(
+        positions=[_pos("NO", 20, "no")],
+        books={
+            "no": _book([(0.28, 100)], [(0.29, 100)]),
+            "yes": _book([], [(0.75, 100)]),
+        },
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    db.record_bot_buy_order("0xW", "o-bot", CID, "no")
+    monitor, eng = _monitor_engine(db, api)
+    monitor._trades_by_cid[CID] = [
+        _sell_fill("no", 20, 0.30, ts=1, side="BUY", order_id="o-bot")
+    ]
+    eng.on_reward_fill(_proven_fill(db, api, "no", 20, price=0.30))
+    eng.run_tick(open_orders=[], positions=[_pos("NO", 20, "no")])
+    assert api._placed_post_only_sells == [("no", 0.29, 20)]
+    # old Maker SELL 20 fills during cancellation; fresh CLOB contains SELL20;
+    # Data API still stale (position NO20)
+    api._trades[CID] = [_sell_fill("no", 20, 0.29, ts=time.time() + 5)]
+    api.set_open_orders(
+        [{"id": "s-old", "side": "SELL", "asset_id": "no", "original_size": 20, "size_matched": 0, "price": 0.295}]
+    )
+    eng.run_tick(open_orders=api.get_open_orders(), positions=[_pos("NO", 20, "no")])
+    # recancel path runs (stale preview says managed 20), but the TRUE fresh
+    # managed replay says 0 -> replacement SELL = 0
+    assert "s-old" in api._cancelled
+    assert len(api._placed_post_only_sells) == 1
+
+
+def test_fix4_stale_prefetch_opposite_cap(tmp_path):
+    db = _db(tmp_path, _template_fast(size_tiers=[_tier()]))
+    api = FakeAPI(
+        positions=[_pos("NO", 20, "no")],
+        books={"yes": _book([(0.30, 300)], [(0.31, 1000)])},
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    db.record_bot_buy_order("0xW", "o-bot", CID, "no")
+    # fresh CLOB: Maker SELL 10 confirmed
+    api._trades[CID] = [_sell_fill("no", 10, 0.29, ts=time.time() + 5)]
+    monitor, eng = _monitor_engine(db, api)
+    monitor._trades_by_cid[CID] = [
+        _sell_fill("no", 20, 0.30, ts=1, side="BUY", order_id="o-bot")
+    ]
+    eng.on_reward_fill(_proven_fill(db, api, "no", 20, price=0.32))
+    worker = _worker_with_engine(db, api, eng)
+    worker.place_orders([_elig_yes()])
+    # stale residual would say 20; the TRUE fresh managed residual is 10
+    placed = sum(s for _t, _p, s in api._placed_buys)
+    assert placed == 10
+
+
+def test_fix4_stale_prefetch_fok(tmp_path, merge_env):
+    db = _db(tmp_path, _template_fast())
+    api = FakeAPI(
+        positions=[_pos("NO", 20, "no")],
+        books={
+            "no": _book([(0.19, 100)], [(0.20, 100)]),
+            "yes": _book([], [(0.63, 100)]),
+        },
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    db.record_bot_buy_order("0xW", "o-bot", CID, "no")
+    # fresh CLOB: held residual is 10 (bot SELL 10 confirmed)
+    api._trades[CID] = [_sell_fill("no", 10, 0.30, ts=time.time() + 5)]
+    monitor, eng = _monitor_engine(db, api)
+    monitor._trades_by_cid[CID] = [
+        _sell_fill("no", 20, 0.30, ts=1, side="BUY", order_id="o-bot")
+    ]
+    eng.on_reward_fill(_proven_fill(db, api, "no", 20, price=0.30))
+    eng.run_tick(open_orders=[], positions=[_pos("NO", 20, "no")])
+    # stale preview says managed held 20 -> FOK decision; pre-submission TRUE
+    # fresh replay says 10 -> complement FOK exactly 10
+    assert api._placed_foks == [("yes", 10, 0.63)]
+
+
+def test_fix4_cross_tick_merge_stale_cache_no_submit(tmp_path, merge_env):
+    db = _db(tmp_path, _template_fast())
+    api = FakeAPI(
+        positions=[_pos("YES", 20, "yes"), _pos("NO", 20, "no")],
+        books={},
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    db.record_bot_buy_order("0xW", "o-y", CID, "yes")
+    db.record_bot_buy_order("0xW", "o-n", CID, "no")
+    api._bot_fills[CID] = [
+        _sell_fill("yes", 20, 0.30, ts=1, side="BUY", order_id="o-y"),
+        _sell_fill("no", 20, 0.30, ts=1, side="BUY", order_id="o-n"),
+    ]
+    # fresh provenance: bot NO exited (SELL 20); manual NO20 remains in wallet
+    api._trades[CID] = [_sell_fill("no", 20, 0.30, ts=time.time() + 5)]
+    monitor, eng = _monitor_engine(db, api)
+    # previous tick's managed memo says YES20/NO20
+    eng._managed_cache[condition_key(CID)] = {"yes": 20, "no": 20}
+    client = MagicMock()
+    client.submit_merge.return_value.transaction_id = "relayer-1"
+    client.submit_merge.return_value.transaction_hash = "0xh"
+    with patch.object(monitor, "_merge_client", return_value=client):
+        monitor.check_merges(lambda cid: __import__("threading").Lock())
+    # the pre-submission TRUE fresh replay sees managed YES20/NO0 -> no Merge
+    client.submit_merge.assert_not_called()
+
+
+def test_fix4_begin_tick_invalidates_and_worker_calls_before_merges(tmp_path):
+    db = _db(tmp_path, _template_fast())
+    api = FakeAPI(positions=[], books={}, tokens={})
+    monitor, eng = _monitor_engine(db, api)
+    eng._managed_cache[condition_key(CID)] = {"yes": 20, "no": 20}
+    eng.begin_tick()
+    assert eng._managed_cache == {}
+    assert eng._token_cache == {}
+    # the WalletWorker tick invalidates the engine BEFORE check_merges
+    calls = []
+    worker = WalletWorker(api, db, "0xW", {"fill_check_interval_sec": 5})
+    worker._maybe_rebuild_pnl = lambda: None
+
+    class FakeMonitor:
+        last_position_count = None
+
+        def begin_status_tick(self):
+            calls.append("status")
+
+        def exit_engine(self):
+            calls.append("engine")
+            return type(
+                "E", (), {"begin_tick": lambda self: calls.append("engine_begin_tick")}
+            )()
+
+        def check_buy_orders(self):
+            calls.append("buys")
+
+        def check_resolution(self, o):
+            calls.append("resolution")
+
+        def check_merges(self, lock):
+            calls.append("merges")
+
+        def check_inventory_exit(self, o):
+            calls.append("inventory_exit")
+
+        def check_sell_orders(self):
+            calls.append("compliance")
+
+        def publish_status(self):
+            calls.append("publish")
+
+    worker.monitor = FakeMonitor()
+    worker._tick()
+    assert calls.index("engine_begin_tick") < calls.index("merges")

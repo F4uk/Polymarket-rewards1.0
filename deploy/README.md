@@ -75,7 +75,7 @@ systemctl restart pmm         # 重启(重启后需要重新登录网页)
 
 ```bash
 cd /opt/pmm/poly-marketmaker
-sudo -u pmm git reset --hard <上一个可用的 tag>
+sudo -u pmm git fetch --tags origin && sudo -u pmm git merge --ff-only <上一个可用的 tag>(自更新已移除:上游更新按 git fetch -> audit -> merge -> tests -> deploy 手动进行)
 systemctl restart pmm
 ```
 

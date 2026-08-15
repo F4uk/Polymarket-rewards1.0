@@ -10,7 +10,6 @@ import functools
 import logging
 import threading
 import time
-from datetime import datetime, timedelta
 from api.polymarket_api import PolymarketAPI
 from api.proxy import use_proxy
 from config import CATEGORY_CATALOG

@@ -28,6 +28,7 @@ hiddenimports = []
 for pkg in (
     "py_clob_client_v2",
     "py_builder_relayer_client",
+    "py_builder_signing_sdk",
     "eth_account",
     "poly_eip712_structs",
     "coincurve",

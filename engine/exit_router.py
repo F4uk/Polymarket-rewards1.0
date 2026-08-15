@@ -25,7 +25,7 @@ import time
 
 from engine.merge_accounting import consume_fifo_cost, merge_realized_pnl, pair_amount
 from engine.merge import merge_recovery_usd
-from engine.protected_exit import maker_sell_price, protected_fak_plan, quote_direct_exit, quote_merge_route
+from engine.protected_exit import maker_sell_price, quote_direct_exit, quote_merge_route
 from engine.take_profit import effective_theta_stop
 from engine import exit_status
 from api.polymarket_api import OrderRejected
@@ -413,7 +413,7 @@ class ExitRouter:
                     if mq["feasible"]:
                         self._mark_asset(asset_id, None, cid, note="fok-merge")
                         self._start_fok_merge(
-                            cid, asset_id, comp_token, neg_risk, size,
+                            cid, asset_id, comp_token, size,
                             mq["fok_worst_price"], tick_str, tmpl,
                         )
                         return True
@@ -444,7 +444,7 @@ class ExitRouter:
     # ---------------------------------------------------------------- FOK+Merge
 
     def _start_fok_merge(
-        self, cid, asset_id, comp_token, neg_risk, size, worst_price, tick_str, tmpl
+        self, cid, asset_id, comp_token, size, worst_price, tick_str, tmpl
     ):
         """预留 FOK_MERGE 事件 -> 提交 exact-q FOK 补对买单(全成或全不成)。
 
@@ -547,6 +547,10 @@ class ExitRouter:
         cid = ev.get("condition_id", "")
         if not order_id:
             return
+        # 与 Relayer 轮询同款退避:delayed 的 FOK 不每 tick 打 CLOB,30s 一问。
+        if self._now() < self._poll_after.get(eid, 0):
+            return
+        self._poll_after[eid] = self._now() + _POLL_INTERVAL
         try:
             o = self.api.get_order(order_id)
         except Exception as e:

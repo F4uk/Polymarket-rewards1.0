@@ -6,11 +6,13 @@ the same condition are exercised to prove wallet isolation.
 
 import json
 import time
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from engine.inventory_exit import InventoryExitEngine
 from engine.manager import WalletWorker
+from engine.monitor import OrderMonitor
 from models.database import ActiveExitCycleExists, Database
 
 
@@ -59,6 +61,9 @@ class FakeAPI:
         self._cancel_sticky = set(cancel_sticky or [])
         self._resolution = {}
         self._trades = {}
+        # Provenance BUY fills seeded by _proven_fill; kept separate so test
+        # assignments to _trades never wipe bot ownership evidence.
+        self._bot_fills = {}
 
     # --- plumbing ---
     def get_funder(self):
@@ -80,7 +85,9 @@ class FakeAPI:
         return self._books.get(asset) or {"bids": [], "asks": [], "tick_size": "0.01"}
 
     def get_trades(self, params=None):
-        return [t for values in self._trades.values() for t in values]
+        return [t for values in self._bot_fills.values() for t in values] + [
+            t for values in self._trades.values() for t in values
+        ]
 
     def get_market(self, cid):
         return self._tokens.get(cid) or {"tokens": []}
@@ -144,9 +151,15 @@ def _fill(asset, size, price=0.30, market=CID, order_id="o1"):
     }
 
 
-def _proven_fill(db, asset, size, price=0.30, market=CID, order_id="o1", wallet="0xW"):
-    """Record bot-order provenance for the fill, then return the fill event."""
+def _proven_fill(db, api, asset, size, price=0.30, market=CID, order_id="o1", wallet="0xW"):
+    """Record bot-order provenance AND its authoritative BUY fill, then return
+    the fill event (fix pack 3: managed inventory is replayed from fills)."""
     db.record_bot_buy_order(wallet, order_id, market, asset)
+    api._bot_fills.setdefault(market, []).append(
+        # epoch-early ts: the provenance BUY must precede any later SELL fills
+        # in the FIFO managed-inventory replay.
+        _sell_fill(asset, size, price, ts=1.0, side="BUY", order_id=order_id)
+    )
     return _fill(asset, size, price=price, market=market, order_id=order_id)
 
 
@@ -220,7 +233,7 @@ def _seed_bot_inventory(db, api, assets, cid=CID, ts=100.0):
         oid = f"o-seed-{i}"
         db.record_bot_buy_order("0xW", oid, cid, asset)
         fills.append(_sell_fill(asset, qty, price, ts=ts, side="BUY", order_id=oid))
-    api._trades[cid] = fills
+    api._bot_fills[cid] = fills
 
 
 def _pos(side, size, asset, cid=CID):
@@ -279,7 +292,7 @@ def test_flow_a_maker_exit(tmp_path):
     # complement ask expensive -> merge route loses -> maker window
     api._books["yes"] = _book([(0.28, 100)], [(0.75, 100)])
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.29))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.29))
     cycle = db.get_active_exit_cycle("0xW", CID)
     assert cycle is not None
     assert cycle["status"] == "ACTIVE"
@@ -327,8 +340,9 @@ def test_flow_b_opposite_fill_pair_merge(tmp_path, merge_env):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"no": (0.32, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 20, price=0.32))
-    # opposite Reward BUY filled -> complete set
+    eng.on_reward_fill(_proven_fill(db, api, "no", 20, price=0.32))
+    # opposite Reward BUY (also bot-placed) filled -> bot complete set
+    eng.on_reward_fill(_proven_fill(db, api, "yes", 20, price=0.32, order_id="o2"))
     api.set_positions([_pos("NO", 20, "no"), _pos("YES", 20, "yes")])
     eng.run_tick(open_orders=[], positions=[_pos("NO", 20, "no"), _pos("YES", 20, "yes")])
     # Rule #2: complete set is Merge-first; no unilateral sell.
@@ -350,7 +364,8 @@ def test_flow_b_opposite_fill_pair_merge(tmp_path, merge_env):
     legs = db.get_exit_legs(closed[0]["id"])
     methods = {l["exit_method"] for l in legs if l["exit_method"]}
     assert methods == {"MERGE"}
-    assert closed[0]["inventory_pnl"] == pytest.approx(20 - 20 * 0.32, abs=1e-6)
+    # both legs were bot reward buys: NO20@0.32 + YES20@0.32, merged back to 20
+    assert closed[0]["inventory_pnl"] == pytest.approx(20 - 2 * 20 * 0.32, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +390,7 @@ def test_flow_c_fok_merge_full_sequence(tmp_path, merge_env):
         ]
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=api.get_open_orders(), positions=[_pos("NO", 50, "no")])
     # 1) opposite Reward BUY and SELL reservation cancelled BEFORE the FOK
     assert set(api._cancelled) == {"b1", "s1"}
@@ -426,7 +441,7 @@ def test_flow_d_protected_direct_exit(tmp_path):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     # protected FAK at the depth worst acceptable price, not uncontrolled FAK
     assert api._placed_market_sells == [("no", 0.28, 50)]
@@ -510,7 +525,7 @@ def test_flow_f_partial_maker_exit_recalculates(tmp_path):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     assert api._placed_post_only_sells == [("no", 0.29, 50)]
 
@@ -548,7 +563,7 @@ def test_flow_g_lagged_data_api_no_duplicate_exit(tmp_path):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     assert len(api._placed_market_sells) == 1
     # Data API still shows the position (lag): the CLOSING guard suppresses a
@@ -571,7 +586,7 @@ def test_churn_same_token_rebuy_blocked_and_opposite_capped(tmp_path):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api)
-    eng.on_reward_fill(_proven_fill(db, "no", 20, price=0.32))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 20, price=0.32))
     # same held token: blocked while the cycle owns residual
     authority = eng.authorize_placement(CID, "no", "NO", 50, [])
     assert authority["kind"] == "same_token_block" and authority["allowed"] is False
@@ -611,7 +626,7 @@ def test_churn_after_close_cooldown_still_applies(tmp_path):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 20, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 20, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 20, "no")])
     api.set_positions([])
     eng.run_tick(open_orders=[], positions=[])
@@ -644,7 +659,7 @@ def test_race_fok_withheld_when_cancellation_not_reconciled(tmp_path, merge_env)
         [{"id": "b1", "side": "BUY", "asset_id": "yes", "original_size": 30, "size_matched": 0}]
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=api.get_open_orders(), positions=[_pos("NO", 50, "no")])
     # cancellation rejected -> FOK must never be submitted
     assert api._placed_foks == []
@@ -662,10 +677,10 @@ def test_race_two_processes_same_condition_unique_cycle(tmp_path):
     api2 = FakeAPI(positions=[], books={}, tokens={"0x" + "c" * 64: _market_api()})
     eng1 = _engine(db1, api1)
     eng2 = _engine(db2, api2)
-    eng1.on_reward_fill(_proven_fill(db1, "no", 20))
+    eng1.on_reward_fill(_proven_fill(db1, api1, "no", 20))
     # A second process joining the same (wallet, condition) must JOIN the one
     # active cycle, never create a duplicate.
-    eng2.on_reward_fill(_proven_fill(db2, "no", 20))
+    eng2.on_reward_fill(_proven_fill(db2, api2, "no", 20))
     cycle = db2.get_active_exit_cycle("0xW", CID)
     assert cycle["initial_qty"] == 40
     assert len(db2.get_non_closed_exit_cycles("0xW")) == 1
@@ -689,8 +704,8 @@ def test_race_multiple_conditions_do_not_block_each_other(tmp_path, merge_env):
         },
     )
     eng = _engine(db, api, costs={"no": (0.30, []), "no-b": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 20, market=CID))
-    eng.on_reward_fill(_proven_fill(db, "no-b", 20, market=CID_B))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 20, market=CID))
+    eng.on_reward_fill(_proven_fill(db, api, "no-b", 20, market=CID_B))
     # A goes FOK (CLOSING) while B takes the maker window; B must not be blocked.
     eng.run_tick(
         open_orders=[],
@@ -704,7 +719,7 @@ def test_race_two_wallets_same_condition_isolated(tmp_path):
     db = _db(tmp_path, _template_fast())
     api_a = FakeAPI(positions=[], books={}, tokens={"0x" + "c" * 64: _market_api()})
     eng_a = _engine(db, api_a)
-    eng_a.on_reward_fill(_proven_fill(db, "no", 20, price=0.32))
+    eng_a.on_reward_fill(_proven_fill(db, api_a, "no", 20, price=0.32))
     # wallet B is not blocked by wallet A's cycle
     api_b = FakeAPI(positions=[], books={}, tokens={"0x" + "c" * 64: _market_api()})
     eng_b = InventoryExitEngine(
@@ -713,7 +728,7 @@ def test_race_two_wallets_same_condition_isolated(tmp_path):
         cost_provider=lambda asset, size, cid: (0.30, []),
         book_provider=lambda asset: api_b.get_orderbook(asset),
     )
-    eng_b.on_reward_fill(_proven_fill(db, "no", 20, price=0.32, wallet="0xWB"))
+    eng_b.on_reward_fill(_proven_fill(db, api_b, "no", 20, price=0.32, wallet="0xWB"))
     cycles = db.get_non_closed_exit_cycles()
     assert {c["wallet"] for c in cycles} == {"0xW", "0xWB"}
     authority = eng_b.authorize_placement(CID, "no", "NO", 50, [])
@@ -785,7 +800,7 @@ def test_low_balance_skips_maker_wait_for_residual(tmp_path, merge_env):
     )
     api._balance = 3.0
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     # low balance: no 30s maker wait; immediate protected direct exit
     assert api._placed_market_sells == [("no", 0.28, 50)]
@@ -825,7 +840,7 @@ def test_resolution_immediate_safe_route_and_merge_first(tmp_path, merge_env):
     )
     api2._resolution[CID] = "resolved"
     eng2 = _engine(db2, api2, costs={"no": (0.30, [])})
-    eng2.on_reward_fill(_proven_fill(db2, "no", 50, price=0.30))
+    eng2.on_reward_fill(_proven_fill(db2, api2, "no", 50, price=0.30))
     eng2.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     assert api2._placed_market_sells == [("no", 0.28, 50)]
 
@@ -964,7 +979,7 @@ def test_planned_fok_not_repeated_and_submitted_merge_not_repeated(tmp_path):
     op_id = db.create_merge_operation("0xW", "0xFunder", CID, "yes", "no", 50.0)
     db.update_merge_operation(op_id, "planned", error="FOK accepted; awaiting confirmed Data API inventory")
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     assert api._placed_foks == []
     assert api._placed_market_sells == []
@@ -1002,7 +1017,7 @@ def test_audit_a_barrier_query_failure_blocks_all_funds_paths(tmp_path):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     db.get_unresolved_merges = lambda *a, **kw: (_ for _ in ()).throw(
         RuntimeError("db down")
     )
@@ -1031,7 +1046,7 @@ def test_audit_b_direct_cancel_error_blocks_no_fak(tmp_path):
         [{"id": "s1", "side": "SELL", "asset_id": "no", "original_size": 50, "size_matched": 0}]
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=api.get_open_orders(), positions=[_pos("NO", 50, "no")])
     assert api._placed_market_sells == []
     cycle = db.get_active_exit_cycle("0xW", CID)
@@ -1054,7 +1069,7 @@ def test_audit_b_direct_cancel_not_reconciled_blocks_no_fak(tmp_path):
         [{"id": "s1", "side": "SELL", "asset_id": "no", "original_size": 50, "size_matched": 0}]
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=api.get_open_orders(), positions=[_pos("NO", 50, "no")])
     # cancel response returned but the SELL is still visible -> no FAK
     assert "s1" in api._cancelled
@@ -1094,7 +1109,7 @@ def test_audit_b_direct_uses_fresh_residual_and_depth_after_cancel(tmp_path):
     api.get_user_positions = positions_fn
     api.get_orderbook = book_fn
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     # FAK uses the FRESH residual (30) and FRESH worst price (0.25)
     assert api._placed_market_sells == [("no", 0.25, 30)]
@@ -1117,7 +1132,7 @@ def test_audit_c_no_complement_fok_when_merge_not_ready(tmp_path, merge_env, rea
         db, api, costs={"no": (0.30, [])},
         readiness=lambda: (False, reason),
     )
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     # credentials exist (merge_env) but runtime readiness fails -> zero FOK
     assert api._placed_foks == []
@@ -1136,7 +1151,7 @@ def test_audit_c_ready_route_executes_fok(tmp_path, merge_env):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     assert api._placed_foks == [("yes", 50, 0.63)]
 
@@ -1175,7 +1190,7 @@ def test_audit_d_opposite_buys_reconciled_to_total_target(tmp_path):
         [{"id": "b1", "side": "BUY", "asset_id": "yes", "original_size": 30, "size_matched": 0, "price": 0.30}]
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 20, price=0.32))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 20, price=0.32))
     worker = _worker_with_engine(db, api, eng)
     worker.place_orders([_elig_yes()])
     # residual 20: the resting 30 must shrink to a TOTAL target of 20
@@ -1310,8 +1325,8 @@ def test_audit_g_type1_pair_does_not_freeze(tmp_path):
         signature_type=2,
     )
     eng = _engine(db, api, costs={"yes": (0.30, []), "no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "yes", 20, price=0.30))
-    eng.on_reward_fill(_proven_fill(db, "no", 20, price=0.30, order_id="o2"))
+    eng.on_reward_fill(_proven_fill(db, api, "yes", 20, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 20, price=0.30, order_id="o2"))
     eng.run_tick(
         open_orders=[],
         positions=[_pos("YES", 20, "yes"), _pos("NO", 20, "no")],
@@ -1335,8 +1350,8 @@ def test_audit_g_type3_merge_disabled_pair_does_not_freeze(tmp_path):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"yes": (0.30, []), "no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "yes", 20, price=0.30))
-    eng.on_reward_fill(_proven_fill(db, "no", 20, price=0.30, order_id="o2"))
+    eng.on_reward_fill(_proven_fill(db, api, "yes", 20, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 20, price=0.30, order_id="o2"))
     eng.run_tick(
         open_orders=[],
         positions=[_pos("YES", 20, "yes"), _pos("NO", 20, "no")],
@@ -1358,8 +1373,8 @@ def test_audit_g_dust_pair_below_minimum_does_not_noop_forever(tmp_path):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"yes": (0.30, []), "no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "yes", 0.5, price=0.30))
-    eng.on_reward_fill(_proven_fill(db, "no", 0.5, price=0.30, order_id="o2"))
+    eng.on_reward_fill(_proven_fill(db, api, "yes", 0.5, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 0.5, price=0.30, order_id="o2"))
     eng.run_tick(
         open_orders=[],
         positions=[_pos("YES", 0.5, "yes"), _pos("NO", 0.5, "no")],
@@ -1383,7 +1398,7 @@ def test_audit_i_rested_maker_then_market_counts_only_market(tmp_path):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     assert api._placed_post_only_sells == [("no", 0.29, 50)]
     # maker never filled; window times out -> protected MARKET exit
@@ -1445,7 +1460,7 @@ def test_fix2_gate_split_opening_allowed_fok_forbidden(tmp_path, merge_env, reas
     # ...but execution readiness ALWAYS validates
     ready, exec_reason = eng.merge_execution_ready()
     assert ready is False and exec_reason == reason
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     # complement FOK MUST remain forbidden
     assert api._placed_foks == []
@@ -1464,7 +1479,7 @@ def test_fix2_cap_cancel_raises_no_replacement(tmp_path):
         [{"id": "b1", "side": "BUY", "asset_id": "yes", "original_size": 20, "size_matched": 0, "price": 0.30}]
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 10, price=0.32))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 10, price=0.32))
     worker = _worker_with_engine(db, api, eng)
     worker.place_orders([_elig_yes()])
     # residual 10, open 20: cancel raises -> open stays 20, ZERO new BUY
@@ -1484,7 +1499,7 @@ def test_fix2_cap_cancel_not_reconciled_no_replacement(tmp_path):
         [{"id": "b1", "side": "BUY", "asset_id": "yes", "original_size": 20, "size_matched": 0, "price": 0.30}]
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 10, price=0.32))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 10, price=0.32))
     worker = _worker_with_engine(db, api, eng)
     worker.place_orders([_elig_yes()])
     # cancel response returned but b1 still visible -> ZERO new BUY
@@ -1503,7 +1518,7 @@ def test_fix2_cap_cancel_confirmed_replaces_down_to_residual(tmp_path):
         [{"id": "b1", "side": "BUY", "asset_id": "yes", "original_size": 20, "size_matched": 0, "price": 0.30}]
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 10, price=0.32))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 10, price=0.32))
     worker = _worker_with_engine(db, api, eng)
     worker.place_orders([_elig_yes()])
     assert "b1" in api._cancelled
@@ -1565,7 +1580,7 @@ def test_fix2_partial_maker_fill_remainder_two_stages(tmp_path):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     assert api._placed_post_only_sells == [("no", 0.29, 50)]
     # stage 1: 20 filled, 30 still resting
@@ -1613,7 +1628,7 @@ def test_fix2_partial_maker_then_market_is_mixed(tmp_path):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     # partial 20 -> remainder 30 still resting
     api._trades[CID] = [_sell_fill("no", 20, 0.29, ts=time.time() + 5)]
@@ -1660,7 +1675,7 @@ def test_fix2_fok_complement_refines_to_actual_fill(tmp_path, merge_env):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 50, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
     assert api._placed_foks == [("yes", 50, 0.63)]
     op = db.get_unresolved_merges("0xW")[0]
@@ -1699,11 +1714,11 @@ def test_fix2_held_assets_json_persists_and_collapses(tmp_path, merge_env):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"no": (0.30, []), "yes": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "no", 30, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 30, price=0.30))
     cycle = db.get_active_exit_cycle("0xW", CID)
     assert json.loads(cycle["held_assets_json"]) == ["no"]
     # YES joins the cycle
-    eng.on_reward_fill(_proven_fill(db, "yes", 30, price=0.30, order_id="o2"))
+    eng.on_reward_fill(_proven_fill(db, api, "yes", 30, price=0.30, order_id="o2"))
     cycle = db.get_active_exit_cycle("0xW", CID)
     assert json.loads(cycle["held_assets_json"]) == ["no", "yes"]
     # Merge consumes the pair, leaving only NO 10
@@ -1728,8 +1743,8 @@ def test_fix2_per_asset_closing_does_not_freeze_other_side(tmp_path):
         tokens={"0x" + "c" * 64: _market_api()},
     )
     eng = _engine(db, api, costs={"yes": (0.30, []), "no": (0.30, [])})
-    eng.on_reward_fill(_proven_fill(db, "yes", 20, price=0.30))
-    eng.on_reward_fill(_proven_fill(db, "no", 20, price=0.30, order_id="o2"))
+    eng.on_reward_fill(_proven_fill(db, api, "yes", 20, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 20, price=0.30, order_id="o2"))
     cycle = db.get_active_exit_cycle("0xW", CID)
     # age the window so both sides would route DIRECT
     db.update_exit_cycle(cycle["id"], opened_at=cycle["opened_at"] - 31)
@@ -1744,3 +1759,306 @@ def test_fix2_per_asset_closing_does_not_freeze_other_side(tmp_path):
     assert all(t != "yes" for t, _p, _s in api._placed_market_sells)
     cycle = db.get_active_exit_cycle("0xW", CID)
     assert cycle["status"] == "CLOSING"
+
+
+# ---------------------------------------------------------------------------
+# Fix pack 3 regressions (final funds safety)
+# ---------------------------------------------------------------------------
+
+
+def test_fix3_mixed_same_token_no_oversell_and_closes_on_managed_zero(tmp_path):
+    db = _db(tmp_path, _template_fast(maker_exit_wait_sec=0))
+    api = FakeAPI(
+        positions=[_pos("NO", 50, "no")],
+        books={
+            "no": _book([(0.28, 100)], [(0.30, 100)]),
+            "yes": _book([], [(0.78, 100)]),
+        },
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    # bot NO20 + manual NO30 (wallet position NO50)
+    db.record_bot_buy_order("0xW", "o-bot", CID, "no")
+    api._bot_fills[CID] = [
+        _sell_fill("no", 20, 0.30, ts=100, side="BUY", order_id="o-bot")
+    ]
+    eng = _engine(db, api, costs={"no": (0.30, [])})
+    eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
+    cycle = db.get_active_exit_cycle("0xW", CID)
+    assert cycle is not None
+    assert cycle["managed_qty"] == pytest.approx(20)
+    # direct SELL maximum = managed 20, never the wallet's 50
+    assert api._placed_market_sells == [("no", 0.28, 20)]
+    # bot SELL 20 confirms -> managed 0 -> cycle CLOSED, manual NO30 remains
+    api._trades[CID] = [_sell_fill("no", 20, 0.28, ts=time.time() + 5)]
+    api.set_positions([_pos("NO", 30, "no")])
+    eng.run_tick(open_orders=[], positions=[_pos("NO", 30, "no")])
+    assert db.get_active_exit_cycle("0xW", CID) is None
+    closed = db.get_exit_cycles(wallet="0xW", statuses=["CLOSED"])[0]
+    assert closed["error"] == ""
+    assert closed["realized_recovered_collateral"] == pytest.approx(5.6)
+    # the manual 30 is never re-adopted or re-sold
+    eng.run_tick(open_orders=[], positions=[_pos("NO", 30, "no")])
+    assert db.get_active_exit_cycle("0xW", CID) is None
+    assert api._placed_market_sells == [("no", 0.28, 20)]
+
+
+def test_fix3_manual_opposite_side_is_never_auto_merged(tmp_path, merge_env):
+    db = _db(tmp_path, _template_fast())
+    api = FakeAPI(
+        positions=[_pos("NO", 20, "no"), _pos("YES", 20, "yes")],
+        books={},
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    # bot NO20 only; the YES20 is manual (no provenance)
+    db.record_bot_buy_order("0xW", "o-bot", CID, "no")
+    api._bot_fills[CID] = [
+        _sell_fill("no", 20, 0.30, ts=100, side="BUY", order_id="o-bot")
+    ]
+    eng = _engine(db, api, costs={"no": (0.30, []), "yes": (0.30, [])})
+    eng.run_tick(
+        open_orders=[],
+        positions=[_pos("NO", 20, "no"), _pos("YES", 20, "yes")],
+    )
+    cycle = db.get_active_exit_cycle("0xW", CID)
+    # managed pair = 0: manual YES must never be merged with bot NO
+    assert cycle["paired_qty"] == 0
+    assert cycle["selected_route"] != "MERGE_FIRST"
+
+
+def test_fix3_direct_fresh_qty_capped_to_managed(tmp_path):
+    db = _db(tmp_path, _template_fast(maker_exit_wait_sec=0))
+    api = FakeAPI(
+        positions=[_pos("NO", 50, "no")],
+        books={
+            "no": _book([(0.28, 100)], [(0.30, 100)]),
+            "yes": _book([], [(0.78, 100)]),
+        },
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    db.record_bot_buy_order("0xW", "o-bot", CID, "no")
+    api._bot_fills[CID] = [
+        _sell_fill("no", 20, 0.30, ts=100, side="BUY", order_id="o-bot")
+    ]
+    eng = _engine(db, api, costs={"no": (0.30, [])})
+    eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
+    # FAK fresh qty = min(position 50, managed 20) = 20
+    assert api._placed_market_sells == [("no", 0.28, 20)]
+
+
+def test_fix3_fok_qty_capped_to_managed(tmp_path, merge_env):
+    db = _db(tmp_path, _template_fast())
+    api = FakeAPI(
+        positions=[_pos("NO", 50, "no")],
+        books={
+            "no": _book([(0.19, 100)], [(0.20, 100)]),
+            "yes": _book([], [(0.63, 100)]),
+        },
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    db.record_bot_buy_order("0xW", "o-bot", CID, "no")
+    api._bot_fills[CID] = [
+        _sell_fill("no", 20, 0.30, ts=100, side="BUY", order_id="o-bot")
+    ]
+    eng = _engine(db, api, costs={"no": (0.30, [])})
+    eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
+    # complement FOK qty = managed 20, never the wallet's 50
+    assert api._placed_foks == [("yes", 20, 0.63)]
+
+
+def test_fix3_fresh_managed_residual_controls_opposite_cap(tmp_path):
+    db = _db(tmp_path, _template_fast(size_tiers=[_tier()]))
+    api = FakeAPI(
+        positions=[_pos("NO", 20, "no")],
+        books={"yes": _book([(0.30, 300)], [(0.31, 1000)])},
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    eng = _engine(db, api, costs={"no": (0.30, [])})
+    eng.on_reward_fill(_proven_fill(db, api, "no", 20, price=0.32))
+    # maker SELL fills 10 before the replacement round -> fresh managed 10
+    api._trades[CID] = [_sell_fill("no", 10, 0.29, ts=time.time() + 5)]
+    worker = _worker_with_engine(db, api, eng)
+    worker.place_orders([_elig_yes()])
+    placed = sum(s for _t, _p, s in api._placed_buys)
+    assert placed == 10
+
+
+def test_fix3_maker_recancel_cancel_raises_no_replacement(tmp_path):
+    db = _db(tmp_path, _template_fast())
+    api = FakeAPI(
+        positions=[_pos("NO", 50, "no")],
+        books={
+            "no": _book([(0.28, 100)], [(0.29, 100)]),
+            "yes": _book([], [(0.75, 100)]),
+        },
+        tokens={"0x" + "c" * 64: _market_api()},
+        cancel_blocks={"s-old"},
+    )
+    eng = _engine(db, api, costs={"no": (0.30, [])})
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
+    eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
+    # repricing required (price mismatch) but the cancel raises
+    api.set_open_orders(
+        [{"id": "s-old", "side": "SELL", "asset_id": "no", "original_size": 50, "size_matched": 0, "price": 0.295}]
+    )
+    eng.run_tick(open_orders=api.get_open_orders(), positions=[_pos("NO", 50, "no")])
+    # no replacement SELL
+    assert len(api._placed_post_only_sells) == 1
+
+
+def test_fix3_maker_recancel_unconfirmed_no_replacement(tmp_path):
+    db = _db(tmp_path, _template_fast())
+    api = FakeAPI(
+        positions=[_pos("NO", 50, "no")],
+        books={
+            "no": _book([(0.28, 100)], [(0.29, 100)]),
+            "yes": _book([], [(0.75, 100)]),
+        },
+        tokens={"0x" + "c" * 64: _market_api()},
+        cancel_sticky={"s-old"},
+    )
+    eng = _engine(db, api, costs={"no": (0.30, [])})
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
+    eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
+    api.set_open_orders(
+        [{"id": "s-old", "side": "SELL", "asset_id": "no", "original_size": 50, "size_matched": 0, "price": 0.295}]
+    )
+    eng.run_tick(open_orders=api.get_open_orders(), positions=[_pos("NO", 50, "no")])
+    assert "s-old" in api._cancelled
+    assert len(api._placed_post_only_sells) == 1
+
+
+def test_fix3_maker_recancel_confirmed_with_fills(tmp_path):
+    db = _db(tmp_path, _template_fast())
+    api = FakeAPI(
+        positions=[_pos("NO", 50, "no")],
+        books={
+            "no": _book([(0.28, 100)], [(0.29, 100)]),
+            "yes": _book([], [(0.75, 100)]),
+        },
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    eng = _engine(db, api, costs={"no": (0.30, [])})
+    eng.on_reward_fill(_proven_fill(db, api, "no", 50, price=0.30))
+    eng.run_tick(open_orders=[], positions=[_pos("NO", 50, "no")])
+    # 20 filled during the rest; the still-resting 30 is repriced
+    api._trades[CID] = [_sell_fill("no", 20, 0.29, ts=time.time() + 5)]
+    api.set_positions([_pos("NO", 30, "no")])
+    api.set_open_orders(
+        [{"id": "s-old", "side": "SELL", "asset_id": "no", "original_size": 50, "size_matched": 20, "price": 0.295}]
+    )
+    eng.run_tick(open_orders=api.get_open_orders(), positions=[_pos("NO", 30, "no")])
+    # old SELL cancelled and CONFIRMED cancelled before the replacement
+    assert "s-old" in api._cancelled
+    cycle = db.get_active_exit_cycle("0xW", CID)
+    legs = db.get_exit_legs(cycle["id"])
+    maker_legs = [l for l in legs if l["kind"] == "maker_sell"]
+    confirmed = [l for l in maker_legs if l["status"] == "confirmed"]
+    cancelled = [l for l in maker_legs if l["status"] == "cancelled"]
+    assert sum(l["qty"] for l in confirmed) == pytest.approx(20)
+    assert sum(l["qty"] for l in cancelled) == pytest.approx(30)
+    # fresh managed residual 30 -> replacement POST-ONLY for 30
+    assert api._placed_post_only_sells[-1] == ("no", 0.29, 30)
+
+
+def test_fix3_provenance_persist_failure_cancels_placed_buy(tmp_path):
+    db = _db(tmp_path, _template_fast(size_tiers=[_tier()]))
+    api = FakeAPI(
+        positions=[],
+        books={"yes": _book([(0.30, 300)], [(0.31, 1000)])},
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    eng = _engine(db, api)
+    worker = _worker_with_engine(db, api, eng)
+    db.record_bot_buy_order = lambda *a, **kw: (_ for _ in ()).throw(
+        RuntimeError("disk full")
+    )
+    worker.place_orders([_elig_yes()])
+    # the placed order was cancelled and confirmed; no further placement
+    assert api._cancelled == ["bot-1"]
+    assert len(api._placed_buys) == 1
+
+
+def test_fix3_pure_bot_flow_merge_first(tmp_path, merge_env):
+    db = _db(tmp_path, _template_fast())
+    api = FakeAPI(
+        positions=[_pos("YES", 20, "yes"), _pos("NO", 20, "no")],
+        books={},
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    eng = _engine(db, api, costs={"yes": (0.30, []), "no": (0.30, [])})
+    eng.on_reward_fill(_proven_fill(db, api, "yes", 20, price=0.30))
+    eng.on_reward_fill(_proven_fill(db, api, "no", 20, price=0.30, order_id="o2"))
+    eng.run_tick(
+        open_orders=[],
+        positions=[_pos("YES", 20, "yes"), _pos("NO", 20, "no")],
+    )
+    cycle = db.get_active_exit_cycle("0xW", CID)
+    assert cycle["paired_qty"] == 20
+    assert cycle["selected_route"] == "MERGE_FIRST"
+    assert api._placed_post_only_sells == []
+
+
+def test_fix3_check_merges_manual_opposite_never_merged(tmp_path, merge_env):
+    db = _db(tmp_path, _template_fast())
+    api = FakeAPI(
+        positions=[_pos("NO", 20, "no"), _pos("YES", 20, "yes")],
+        books={},
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    db.record_bot_buy_order("0xW", "o-bot", CID, "no")
+    api._bot_fills[CID] = [
+        _sell_fill("no", 20, 0.30, ts=100, side="BUY", order_id="o-bot")
+    ]
+    monitor = OrderMonitor(api, db, "0xW")
+    client = MagicMock()
+    client.submit_merge.return_value.transaction_id = "relayer-1"
+    client.submit_merge.return_value.transaction_hash = "0xh"
+    with patch.object(monitor, "_merge_client", return_value=client):
+        monitor.check_merges(lambda cid: __import__("threading").Lock())
+    client.submit_merge.assert_not_called()
+    assert db.get_unresolved_merges("0xW") == []
+
+
+def test_fix3_check_merges_caps_to_managed_pair(tmp_path, merge_env):
+    db = _db(tmp_path, _template_fast())
+    api = FakeAPI(
+        positions=[_pos("YES", 50, "yes"), _pos("NO", 20, "no")],
+        books={},
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    # bot YES20 + bot NO20; the other YES30 is manual
+    db.record_bot_buy_order("0xW", "o-y", CID, "yes")
+    db.record_bot_buy_order("0xW", "o-n", CID, "no")
+    api._bot_fills[CID] = [
+        _sell_fill("yes", 20, 0.30, ts=100, side="BUY", order_id="o-y"),
+        _sell_fill("no", 20, 0.30, ts=100, side="BUY", order_id="o-n"),
+    ]
+    monitor = OrderMonitor(api, db, "0xW")
+    client = MagicMock()
+    client.submit_merge.return_value.transaction_id = "relayer-1"
+    client.submit_merge.return_value.transaction_hash = "0xh"
+    with patch.object(monitor, "_merge_client", return_value=client):
+        monitor.check_merges(lambda cid: __import__("threading").Lock())
+    client.submit_merge.assert_called_once_with("0xFunder", CID, 20.0)
+
+
+def test_fix3_check_merges_pure_bot_merges(tmp_path, merge_env):
+    db = _db(tmp_path, _template_fast())
+    api = FakeAPI(
+        positions=[_pos("YES", 20, "yes"), _pos("NO", 20, "no")],
+        books={},
+        tokens={"0x" + "c" * 64: _market_api()},
+    )
+    db.record_bot_buy_order("0xW", "o-y", CID, "yes")
+    db.record_bot_buy_order("0xW", "o-n", CID, "no")
+    api._bot_fills[CID] = [
+        _sell_fill("yes", 20, 0.30, ts=100, side="BUY", order_id="o-y"),
+        _sell_fill("no", 20, 0.30, ts=100, side="BUY", order_id="o-n"),
+    ]
+    monitor = OrderMonitor(api, db, "0xW")
+    client = MagicMock()
+    client.submit_merge.return_value.transaction_id = "relayer-1"
+    client.submit_merge.return_value.transaction_hash = "0xh"
+    with patch.object(monitor, "_merge_client", return_value=client):
+        monitor.check_merges(lambda cid: __import__("threading").Lock())
+    client.submit_merge.assert_called_once_with("0xFunder", CID, 20.0)

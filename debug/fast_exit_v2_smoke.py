@@ -189,6 +189,7 @@ def main():
     api.positions = [pos("NO", 50, "no")]
     eng = engine(db, api, {"no": 0.30})
     db.record_bot_buy_order("0xW", "o", CID, "no")
+    api.trades[CID] = [sell_fill("no", 50, 0.30, ts=1, side="BUY", order_id="o")]
     eng.on_reward_fill(fill("no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[pos("NO", 50, "no")])
     check(
@@ -208,6 +209,7 @@ def main():
     api2.positions = [pos("NO", 50, "no")]
     eng2 = engine(db2, api2, {"no": 0.30})
     db2.record_bot_buy_order("0xW", "o", CID, "no")
+    api2.trades[CID] = [sell_fill("no", 50, 0.30, ts=1, side="BUY", order_id="o")]
     eng2.on_reward_fill(fill("no", 50, price=0.30))
     eng2.run_tick(open_orders=[], positions=[pos("NO", 50, "no")])
     window_ok = api2.placed_post_only_sells == [("no", 0.29, 50)] and api2.placed_market == []
@@ -280,6 +282,7 @@ def main():
     db5.init()
     template(db5)
     db5.record_bot_buy_order("0xW", "o", CID, "no")
+    api5.trades[CID] = [sell_fill("no", 20, 0.30, ts=1, side="BUY", order_id="o")]
     eng5.on_reward_fill(fill("no", 20, price=0.32))
     same = eng5.authorize_placement(CID, "no", "NO", 50, [])
     check(

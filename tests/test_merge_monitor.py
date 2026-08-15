@@ -40,7 +40,11 @@ def _monitor():
         ],
         [],
     ]
-    db.get_template_for.return_value = {"merge_enabled": True, "merge_min_shares": 1}
+    db.get_template_for.return_value = {
+        "merge_enabled": True,
+        "merge_min_shares": 1,
+        "fast_exit_enabled": False,  # V1 legacy merge path (fix pack 3)
+    }
     db.get_unresolved_merges.return_value = []
     db.get_confirmed_pending_merges.return_value = []
     db.get_merge_inventory_barriers.return_value = []

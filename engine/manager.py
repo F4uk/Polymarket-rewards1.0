@@ -158,6 +158,15 @@ class WalletWorker:
 
         self._maybe_rebuild_pnl()
         self.monitor.begin_status_tick()
+        # Fix pack 4: invalidate the Inventory Exit Engine's per-tick managed
+        # memo BEFORE check_merges — a previous tick's cache must never drive
+        # Merge planning/submission.
+        try:
+            exit_engine = self.monitor.exit_engine()
+            if exit_engine is not None:
+                exit_engine.begin_tick()
+        except Exception as e:
+            logger.warning("exit engine begin_tick failed: %s", e)
         tmpl = self.db.get_template_for(self.wallet_address)
         fast_exit = bool(tmpl.get("fast_exit_enabled", True))
         try:

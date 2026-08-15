@@ -705,7 +705,9 @@ class OrderMonitor:
                             )
                             continue
                     refreshed = self.api.get_user_positions(self._funder())
-                    capped_refreshed = self._managed_capped_group(cid, refreshed)
+                    capped_refreshed = self._managed_capped_group(
+                        cid, refreshed, fresh=True
+                    )
                     if capped_refreshed is None:
                         self.db.update_merge_operation(
                             operation["id"], "planned",
@@ -921,7 +923,9 @@ class OrderMonitor:
                         continue
                 # Refetch after every cancellation: merge only confirmed, free inventory.
                 refreshed = self.api.get_user_positions(self._funder())
-                capped_refreshed = self._managed_capped_group(cid, refreshed)
+                capped_refreshed = self._managed_capped_group(
+                    cid, refreshed, fresh=True
+                )
                 if capped_refreshed is None:
                     logger.warning(
                         "[exit-v2] merge skip %s: managed inventory unavailable "
@@ -979,7 +983,7 @@ class OrderMonitor:
                 reserved[plan.no_asset_id] = plan.qty
         return reserved
 
-    def _managed_capped_group(self, cid, group):
+    def _managed_capped_group(self, cid, group, fresh: bool = False):
         """Cap a position group to bot-managed quantities (fix pack 3).
 
         When fast_exit_enabled, automatic Merge may pair ONLY bot-owned
@@ -989,7 +993,9 @@ class OrderMonitor:
         """
         if not self._fast_exit_enabled():
             return list(group or [])
-        managed = self._inventory_exit().managed_asset_quantities(cid, positions=group)
+        managed = self._inventory_exit().managed_asset_quantities(
+            cid, positions=group, fresh=fresh
+        )
         if managed is None:
             return None
         capped = []

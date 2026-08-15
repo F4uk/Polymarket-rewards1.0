@@ -395,8 +395,28 @@ class InventoryExitEngine:
             logger.warning("orderbook %s fresh refetch failed: %s", asset_id, exc)
             return None
 
-    def _trades(self, condition_id: str):
-        """Raw get_trades for a condition (prefetch cache first), or None."""
+    def _trades(self, condition_id: str, fresh: bool = False):
+        """Raw get_trades for a condition, or None.
+
+        Normal route preview / display uses the per-tick prefetch cache
+        (provider first, direct fallback).  ``fresh=True`` (fix pack 4) MUST
+        mean a NEW CLOB get_trades network read that bypasses EVERY cache —
+        the managed memo, OrderMonitor's ``_trades_by_cid`` prefetch and the
+        injected ``trades_provider`` — through the wallet-proxied API.  A
+        failed fresh read returns None (fail-closed, never a stale answer).
+        """
+        if fresh:
+            try:
+                from py_clob_client_v2.clob_types import TradeParams
+
+                return self.api.get_trades(TradeParams(market=condition_id))
+            except Exception as exc:
+                logger.warning(
+                    "[exit-v2] fresh get_trades(%s) failed: %s",
+                    condition_id,
+                    exc,
+                )
+                return None
         if self._trades_provider is not None:
             try:
                 return self._trades_provider(condition_id)
@@ -525,7 +545,9 @@ class InventoryExitEngine:
         except Exception as exc:
             logger.error("on_reward_fill cycle ledger failed %s: %s", cid, exc)
 
-    def _reconcile_cycle_inventory(self, cycle: dict, group: list[dict]) -> dict:
+    def _reconcile_cycle_inventory(
+        self, cycle: dict, group: list[dict], fresh: bool = False
+    ) -> dict:
         """Update CYCLE MANAGED inventory (fix pack 3).
 
         Separates the wallet inventory snapshot (``group``) from the managed
@@ -556,7 +578,9 @@ class InventoryExitEngine:
             elif outcome == "NO":
                 no_qty += size
                 no_asset = str(pos.get("asset", "") or "")
-        managed = self._managed_asset_quantities(cycle["condition_id"])
+        managed = self._managed_asset_quantities(
+            cycle["condition_id"], fresh=fresh
+        )
         if managed is None:
             return {
                 "unavailable": True,
@@ -611,6 +635,16 @@ class InventoryExitEngine:
             "unavailable": False,
         }
 
+    def begin_tick(self) -> None:
+        """Reset per-tick read caches (fix pack 4, item 3).
+
+        The WalletWorker calls this BEFORE check_merges so the merge pass can
+        never consume a previous tick's managed-inventory memo.  Only read
+        caches are reset; no funds state is touched.
+        """
+        self._managed_cache = {}
+        self._token_cache = {}
+
     def run_tick(
         self,
         open_orders=None,
@@ -621,8 +655,7 @@ class InventoryExitEngine:
         tmpl = self._template()
         if not tmpl.get("fast_exit_enabled", True):
             return  # legacy mode owns post-fill inventory
-        self._token_cache = {}
-        self._managed_cache = {}
+        self.begin_tick()
         if positions is None:
             try:
                 positions = self.api.get_user_positions(self.api.get_funder())
@@ -866,7 +899,8 @@ class InventoryExitEngine:
             )
 
     def _bot_owned_quantities(
-        self, cid, bot_order_ids: set, confirmed_merges: list[dict]
+        self, cid, bot_order_ids: set, confirmed_merges: list[dict],
+        fresh: bool = False,
     ) -> dict:
         """Provably bot-owned shares per asset (audit fix pack 2).
 
@@ -875,7 +909,7 @@ class InventoryExitEngine:
         Manual CLOB BUY fills from the same funder never enter the queue.
         Returns {asset_id: qty}.
         """
-        trades = self._trades(cid)
+        trades = self._trades(cid, fresh=fresh)
         if trades is None:
             return None  # evidence unavailable: unknown != zero (fail-closed)
         try:
@@ -954,7 +988,9 @@ class InventoryExitEngine:
             logger.warning("[exit-v2] provenance query failed %s: %s", cid, exc)
             result = None
         else:
-            result = self._bot_owned_quantities(cid, bot_order_ids, confirmed_merges)
+            result = self._bot_owned_quantities(
+                cid, bot_order_ids, confirmed_merges, fresh=fresh
+            )
         self._managed_cache[key] = result
         return result
 
@@ -1756,12 +1792,12 @@ class InventoryExitEngine:
                     status=CYCLE_BLOCKED, error="positions unavailable before FOK",
                 )
                 return "BLOCKED"
-            # Fix pack 3: the FOK complement quantity must be the exact
-            # managed held residual — never the wallet's total residual.
-            # Recompute managed inventory fresh after the position refetch.
-            self._managed_cache.pop(condition_key(cid), None)
+            # Fix pack 3+4: the FOK complement quantity must be the exact
+            # managed held residual — never the wallet's total residual — and
+            # the managed replay must use TRUE fresh CLOB trades (uncached).
             fresh = self._reconcile_cycle_inventory(
-                {"condition_id": cid}, positions_by_condition(positions).get(cid, [])
+                {"condition_id": cid}, positions_by_condition(positions).get(cid, []),
+                fresh=True,
             )
             if fresh.get("unavailable"):
                 cycle_row = self.db.get_active_exit_cycle(self.wallet_address, cid)
@@ -2372,8 +2408,7 @@ class InventoryExitEngine:
         if not isinstance(cycle, dict):
             return None
         group = positions_by_condition(positions).get(condition_id, [])
-        self._managed_cache.pop(condition_key(condition_id), None)
-        summary = self._reconcile_cycle_inventory(cycle, group)
+        summary = self._reconcile_cycle_inventory(cycle, group, fresh=True)
         if summary.get("unavailable"):
             logger.warning(
                 "[exit-v2] fresh opposite cap: managed inventory unavailable; place nothing"

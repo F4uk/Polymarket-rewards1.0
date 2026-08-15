@@ -201,3 +201,21 @@ cross-market arbitrage, NegRisk conversion, Split arbitrage, prediction logic.
   wallet-scoped; tests include two wallets in one condition.
 - No live funds mutations during implementation/testing; no live BUY/SELL/FOK,
   no live Merge/Split/Redeem/wallet deploy; all funds-path tests use mocks.
+
+## 7. SERVER ROLLOUT REQUIREMENT (fix pack 3)
+
+Before the first V2 canary on a server:
+
+- **open orders = 0** — Reward BUY orders that predate `bot_buy_orders` have no
+  provenance and must not be claimed as bot orders.  They are displayed as
+  `LEGACY/UNPROVEN OPEN BUY` and their fills are treated as UNMANAGED; they are
+  never auto-cancelled, but the operator should clear them before the canary.
+- **legacy unmanaged positions = 0** — inventory without matching
+  `bot_buy_orders` + authoritative BUY fills is never auto-managed (no SELL /
+  FOK / Merge); it is shown as UNMANAGED.  The operator must either close these
+  positions or deliberately accept them as UNMANAGED before enabling V2.
+
+After the canary, every Reward BUY order_id is persisted to `bot_buy_orders`
+at placement; a persistence failure cancels the just-placed order and stops
+the opening path (fail-closed).  Automatic Merge only pairs bot-owned YES/NO
+quantities (managed inventory), never manual inventory on the same funder.

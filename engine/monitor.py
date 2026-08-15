@@ -705,7 +705,14 @@ class OrderMonitor:
                             )
                             continue
                     refreshed = self.api.get_user_positions(self._funder())
-                    final = ordinary_binary_plan(cid, refreshed, minimum)
+                    capped_refreshed = self._managed_capped_group(cid, refreshed)
+                    if capped_refreshed is None:
+                        self.db.update_merge_operation(
+                            operation["id"], "planned",
+                            error="managed inventory unavailable; submission withheld",
+                        )
+                        continue
+                    final = ordinary_binary_plan(cid, capped_refreshed, minimum)
                     if not final:
                         self.db.update_merge_operation(
                             operation["id"], "planned", error="complete set disappeared during planned reconciliation"
@@ -872,6 +879,13 @@ class OrderMonitor:
         for cid, group in positions_by_condition(positions).items():
             if condition_key(cid) in active_conditions:
                 continue
+            group = self._managed_capped_group(cid, group)
+            if group is None:
+                logger.warning(
+                    "[exit-v2] merge skip %s: managed inventory unavailable",
+                    cid,
+                )
+                continue
             plan = ordinary_binary_plan(cid, group, minimum)
             if not plan:
                 continue
@@ -907,7 +921,15 @@ class OrderMonitor:
                         continue
                 # Refetch after every cancellation: merge only confirmed, free inventory.
                 refreshed = self.api.get_user_positions(self._funder())
-                final = ordinary_binary_plan(cid, refreshed, minimum)
+                capped_refreshed = self._managed_capped_group(cid, refreshed)
+                if capped_refreshed is None:
+                    logger.warning(
+                        "[exit-v2] merge skip %s: managed inventory unavailable "
+                        "after cancellation",
+                        cid,
+                    )
+                    continue
+                final = ordinary_binary_plan(cid, capped_refreshed, minimum)
                 if not final:
                     continue
                 try:
@@ -956,6 +978,34 @@ class OrderMonitor:
                 reserved[plan.yes_asset_id] = plan.qty
                 reserved[plan.no_asset_id] = plan.qty
         return reserved
+
+    def _managed_capped_group(self, cid, group):
+        """Cap a position group to bot-managed quantities (fix pack 3).
+
+        When fast_exit_enabled, automatic Merge may pair ONLY bot-owned
+        YES/NO — manual/unproven inventory is never auto-merged.  Returns the
+        capped group, or ``None`` when managed inventory cannot be confirmed
+        (fail-closed: no Merge planning/submission from this snapshot).
+        """
+        if not self._fast_exit_enabled():
+            return list(group or [])
+        managed = self._inventory_exit().managed_asset_quantities(cid, positions=group)
+        if managed is None:
+            return None
+        capped = []
+        for pos in group or []:
+            asset = str(pos.get("asset", "") or "")
+            try:
+                size = float(pos.get("size", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            capped.append(
+                {
+                    **pos,
+                    "size": min(size, managed.get(asset, 0.0)),
+                }
+            )
+        return [p for p in capped if float(p.get("size", 0) or 0) > 0]
 
     def check_resolution(self, open_orders=None):
         """UMA 结算守卫:对已挂买单的市场,一旦 umaResolutionStatus 非空(有人在 UMA

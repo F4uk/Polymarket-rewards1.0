@@ -306,6 +306,8 @@ class InventoryExitEngine:
         self._readiness_cache = (0.0, True, "")
         # condition_key -> until; accepted/indeterminate FOK barrier (V2-owned).
         self._pending_fok_until: dict[str, float] = {}
+        # condition_key -> {asset: managed qty} | None (per-tick memo).
+        self._managed_cache: dict[str, dict | None] = {}
         # cycle_id -> {asset_id: until} — per-asset mutation pending markers so
         # a two-sided cycle never blocks one side on the other's Data API lag.
         self._exit_pending: dict[int, dict[str, float]] = {}
@@ -524,12 +526,20 @@ class InventoryExitEngine:
             logger.error("on_reward_fill cycle ledger failed %s: %s", cid, exc)
 
     def _reconcile_cycle_inventory(self, cycle: dict, group: list[dict]) -> dict:
-        """Update cycle managed inventory from confirmed positions.
+        """Update CYCLE MANAGED inventory (fix pack 3).
 
-        Returns a per-side summary: {yes_qty, no_qty, paired, residual_side,
-        residual_asset, residual_qty, total, yes_asset, no_asset}.
+        Separates the wallet inventory snapshot (``group``) from the managed
+        bot inventory snapshot: managed per asset = min(authoritative
+        provenance replay, wallet position).  Manual / unproven inventory is
+        outside every managed quantity (paired, residual, total, close).
+
+        Returns {yes_qty, no_qty, paired, residual_side, residual_asset,
+        residual_qty, total, yes_asset, no_asset, wallet_total, unavailable}.
+        ``unavailable=True`` means provenance/trades could not be confirmed:
+        the caller must fail closed (no funds mutation).
         """
         yes_qty = no_qty = 0.0
+        wallet_total = 0.0
         yes_asset = no_asset = ""
         for pos in group or []:
             try:
@@ -538,6 +548,7 @@ class InventoryExitEngine:
                 continue
             if size <= 0:
                 continue
+            wallet_total += size
             outcome = str(pos.get("outcome", "")).strip().upper()
             if outcome == "YES":
                 yes_qty += size
@@ -545,8 +556,37 @@ class InventoryExitEngine:
             elif outcome == "NO":
                 no_qty += size
                 no_asset = str(pos.get("asset", "") or "")
+        managed = self._managed_asset_quantities(cycle["condition_id"])
+        if managed is None:
+            return {
+                "unavailable": True,
+                "wallet_total": wallet_total,
+                "yes_qty": yes_qty,
+                "no_qty": no_qty,
+                "paired": 0.0,
+                "residual_side": "",
+                "residual_asset": "",
+                "residual_qty": 0.0,
+                "yes_asset": yes_asset,
+                "no_asset": no_asset,
+                "total": 0.0,
+            }
+        yes_qty = min(yes_qty, float(managed.get(yes_asset, 0) or 0))
+        no_qty = min(no_qty, float(managed.get(no_asset, 0) or 0))
         minimum = float(self._template().get("merge_min_shares", 1) or 0)
-        plan = ordinary_binary_plan(cycle["condition_id"], group or [], minimum)
+        # Keep the V1 ordinary-binary protections (NegRisk / ambiguous / no
+        # plan) while pairing only managed quantities.
+        capped_group = []
+        for pos in group or []:
+            asset = str(pos.get("asset", "") or "")
+            try:
+                size = float(pos.get("size", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            capped_size = min(size, float(managed.get(asset, 0) or 0))
+            if capped_size > 0:
+                capped_group.append({**pos, "size": capped_size})
+        plan = ordinary_binary_plan(cycle["condition_id"], capped_group, minimum)
         paired = float(plan.qty) if plan else 0.0
         residual_side, residual_asset, residual_qty = "", "", 0.0
         if yes_qty > no_qty + EPSILON:
@@ -567,6 +607,8 @@ class InventoryExitEngine:
             "yes_asset": yes_asset,
             "no_asset": no_asset,
             "total": yes_qty + no_qty,
+            "wallet_total": wallet_total,
+            "unavailable": False,
         }
 
     def run_tick(
@@ -580,6 +622,7 @@ class InventoryExitEngine:
         if not tmpl.get("fast_exit_enabled", True):
             return  # legacy mode owns post-fill inventory
         self._token_cache = {}
+        self._managed_cache = {}
         if positions is None:
             try:
                 positions = self.api.get_user_positions(self.api.get_funder())
@@ -612,6 +655,7 @@ class InventoryExitEngine:
             # collateral settlement can catch up before re-scanning.
             self._liquidate_cooldown_until = time.time() + 60
         resolving = self._resolving_conditions(by_condition)
+        self._flag_unproven_open_buys(open_orders or [])
         self._adopt_legacy_inventory(by_condition, open_orders)
         self._retry_close_ledger()
         cycles = self.db.get_non_closed_exit_cycles(self.wallet_address)
@@ -786,6 +830,41 @@ class InventoryExitEngine:
             except ActiveExitCycleExists:
                 continue
 
+    def _flag_unproven_open_buys(self, open_orders) -> None:
+        """Expose LEGACY/UNPROVEN open BUY orders (fix pack 3, item 8).
+
+        Reward BUY orders that predate ``bot_buy_orders`` (or manual CLOB buys)
+        are never claimed as bot provenance.  They are shown as legacy/unproven
+        open buys; nothing is auto-cancelled.  Their fills arrive as UNMANAGED.
+        """
+        buys = [
+            o for o in open_orders or []
+            if str(o.get("side", "")).upper() == "BUY" and o.get("id")
+        ]
+        if not buys:
+            return
+        try:
+            bot_ids = self.db.get_bot_buy_order_ids(self.wallet_address)
+        except Exception:
+            return
+        seen = set()
+        for o in buys:
+            oid = str(o.get("id"))
+            if oid in seen or oid in bot_ids:
+                continue
+            seen.add(oid)
+            self._status_add(
+                market=o.get("market", ""),
+                side="买入",
+                price=str(o.get("price", "")),
+                size=str(o.get("original_size", "")),
+                matched=str(o.get("size_matched", "0")),
+                stage="库存退出",
+                action="⚠️LEGACY/UNPROVEN OPEN BUY",
+                detail="在挂买单无 bot_buy_orders 证据（升级前遗留或手工单）；"
+                "不自动认领；成交按 UNMANAGED 处理",
+            )
+
     def _bot_owned_quantities(
         self, cid, bot_order_ids: set, confirmed_merges: list[dict]
     ) -> dict:
@@ -797,12 +876,12 @@ class InventoryExitEngine:
         Returns {asset_id: qty}.
         """
         trades = self._trades(cid)
-        if not trades:
-            return {}
+        if trades is None:
+            return None  # evidence unavailable: unknown != zero (fail-closed)
         try:
             funder = self.api.get_funder()
         except Exception:
-            return {}
+            return None
         from engine.fills import bot_buy_fills
         from engine.take_profit import remaining_fifo_lots
 
@@ -855,6 +934,49 @@ class InventoryExitEngine:
                 owned_assets[asset] = qty
         return owned_assets
 
+    def _managed_asset_quantities(self, cid, fresh: bool = False):
+        """AUTHORITATIVE CURRENT MANAGED INVENTORY per asset (fix pack 3).
+
+        Recomputed per (wallet, condition, asset) from persisted
+        ``bot_buy_orders`` + matching bot BUY fills + confirmed SELL fills +
+        confirmed Merge consumption (FIFO replay).  Returns {asset: qty} or
+        ``None`` when trades/provenance cannot be confirmed (unknown MUST NOT
+        mean zero for funds mutations).  ``fresh=True`` bypasses the per-tick
+        memo for post-cancellation / pre-FOK recomputation.
+        """
+        key = condition_key(cid)
+        if not fresh and key in self._managed_cache:
+            return self._managed_cache[key]
+        try:
+            bot_order_ids = self.db.get_bot_buy_order_ids(self.wallet_address)
+            confirmed_merges = self.db.get_confirmed_merges(self.wallet_address)
+        except Exception as exc:
+            logger.warning("[exit-v2] provenance query failed %s: %s", cid, exc)
+            result = None
+        else:
+            result = self._bot_owned_quantities(cid, bot_order_ids, confirmed_merges)
+        self._managed_cache[key] = result
+        return result
+
+    def managed_asset_quantities(self, cid, positions=None, fresh: bool = False):
+        """Public: managed qty per asset, capped by the wallet position."""
+        managed = self._managed_asset_quantities(cid, fresh=fresh)
+        if managed is None:
+            return None
+        by_asset = {}
+        for pos in positions or []:
+            asset = str(pos.get("asset", "") or "")
+            if asset:
+                try:
+                    by_asset[asset] = float(pos.get("size", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+        return {
+            a: min(float(q), by_asset.get(a, 0.0))
+            for a, q in managed.items()
+            if q > 0 and by_asset.get(a, 0.0) > 0
+        }
+
     def _route_cycle(
         self, cycle, group, open_orders, resolving: set, low_balance: bool, tmpl: dict
     ) -> None:
@@ -906,6 +1028,18 @@ class InventoryExitEngine:
             return
 
         summary = self._reconcile_cycle_inventory(cycle, group)
+        if summary.get("unavailable"):
+            # Fix pack 3: managed inventory cannot be confirmed -> fail closed.
+            self.db.update_exit_cycle(
+                cycle["id"], status=CYCLE_BLOCKED,
+                error="managed inventory unavailable (trades/provenance unconfirmed)",
+            )
+            self._status_add(
+                market=cid, side="-", price="-", size="-", matched="-",
+                stage="库存退出", action="⚠️BLOCKED·托管库存未知",
+                detail="无法确认 bot 托管库存（成交/证据不可用），禁止资金变更",
+            )
+            return
         self.db.update_exit_cycle(
             cycle["id"],
             managed_qty=summary["total"],
@@ -941,24 +1075,13 @@ class InventoryExitEngine:
         # Build the sides that must be routed.  With automatic Merge actually
         # executable the pair is reserved above; otherwise (audit fix G) BOTH
         # owned sides exit through non-Merge handling instead of freezing.
-        # Audit fix pack 2: per-asset owned quantity caps each side — a mixed
-        # position (bot + manual on the same token) owns at most the proven qty.
-        owned_map = json.loads(cycle.get("owned_by_asset_json") or "{}")
+        # The summary quantities ARE the managed (bot-owned) inventory, so a
+        # mixed position can never sell more than the provably-bot quantity.
         sides = []
         if summary["yes_qty"] > EPSILON and summary["yes_asset"]:
-            qty = min(
-                summary["yes_qty"],
-                float(owned_map.get(summary["yes_asset"], summary["yes_qty"]) or 0),
-            )
-            if qty > EPSILON:
-                sides.append({"side": "YES", "asset": summary["yes_asset"], "qty": qty})
+            sides.append({"side": "YES", "asset": summary["yes_asset"], "qty": summary["yes_qty"]})
         if summary["no_qty"] > EPSILON and summary["no_asset"]:
-            qty = min(
-                summary["no_qty"],
-                float(owned_map.get(summary["no_asset"], summary["no_qty"]) or 0),
-            )
-            if qty > EPSILON:
-                sides.append({"side": "NO", "asset": summary["no_asset"], "qty": qty})
+            sides.append({"side": "NO", "asset": summary["no_asset"], "qty": summary["no_qty"]})
         if not sides:
             self.db.update_exit_cycle(cycle["id"], status=CYCLE_ACTIVE, selected_route="NOOP")
             return
@@ -1633,9 +1756,21 @@ class InventoryExitEngine:
                     status=CYCLE_BLOCKED, error="positions unavailable before FOK",
                 )
                 return "BLOCKED"
+            # Fix pack 3: the FOK complement quantity must be the exact
+            # managed held residual — never the wallet's total residual.
+            # Recompute managed inventory fresh after the position refetch.
+            self._managed_cache.pop(condition_key(cid), None)
             fresh = self._reconcile_cycle_inventory(
                 {"condition_id": cid}, positions_by_condition(positions).get(cid, [])
             )
+            if fresh.get("unavailable"):
+                cycle_row = self.db.get_active_exit_cycle(self.wallet_address, cid)
+                if cycle_row:
+                    self.db.update_exit_cycle(
+                        cycle_row["id"], status=CYCLE_BLOCKED,
+                        error="managed inventory unavailable before FOK",
+                    )
+                return "BLOCKED"
             residual = fresh["residual_qty"]
             if residual <= EPSILON:
                 cycle_row = self.db.get_active_exit_cycle(self.wallet_address, cid)
@@ -1871,12 +2006,23 @@ class InventoryExitEngine:
                     except (TypeError, ValueError):
                         fresh_qty = 0.0
                     break
+            # Fix pack 3: never sell the wallet's full position — the FAK is
+            # capped to the freshly recomputed bot-managed quantity.
+            fresh_managed = self._managed_asset_quantities(cid, fresh=True)
+            if fresh_managed is None:
+                _block(
+                    "managed inventory unavailable before protected exit",
+                    "托管库存无法确认，BLOCKED；不提交 FAK",
+                )
+                return "BLOCKED"
+            fresh_qty = min(fresh_qty, float(fresh_managed.get(asset, 0) or 0))
             if fresh_qty <= EPSILON:
-                # Inventory already gone (another path exited it): no FAK.
+                # Managed inventory already gone (bot-owned portion exited or
+                # never existed): no FAK; the cycle closes on managed zero.
                 self._status_add(
                     market=cid, side="卖出", price="-", size=str(qty), matched="-",
-                    stage="库存退出", action="直卖跳过（库存已变）",
-                    detail="撤单后重查持仓为 0，不提交 FAK",
+                    stage="库存退出", action="直卖跳过（托管库存已变）",
+                    detail="撤单后重查托管库存为 0，不提交 FAK；周期按托管库存收敛",
                 )
                 return "NOOP"
             fresh_book = self._fresh_book(asset) or {}
@@ -1980,30 +2126,77 @@ class InventoryExitEngine:
             if plan["cancel_ids"]:
                 try:
                     self.api.cancel_orders(plan["cancel_ids"])
-                    cycle_row = cycle or self.db.get_active_exit_cycle(
-                        self.wallet_address, cid
-                    )
-                    if cycle_row:
-                        # Fix pack 2: repriced rests are superseded intents —
-                        # they never filled and must never capture the new
-                        # order's fills.
-                        for leg in self.db.get_exit_legs(cycle_row["id"]):
-                            if (
-                                leg.get("kind") == LEG_MAKER_SELL
-                                and str(leg.get("asset_id", "")) == str(asset)
-                                and leg.get("status") == LEG_RESTED
-                            ):
-                                self.db.update_exit_leg(
-                                    leg["id"], status=LEG_CANCELLED,
-                                    note="superseded by repriced maker escape",
-                                )
-                    self._record_action(
-                        cid, "exit_recancel", "-", -1, qty,
-                        "撤与持仓不符的旧卖单，改挂 MAKER 逃生价", f"cancel {len(plan['cancel_ids'])} SELL",
-                    )
                 except Exception as exc:
+                    # Fix pack 3: a failed cancellation means NO replacement.
                     logger.warning("[exit-v2] maker recancel failed: %s", exc)
+                    self._status_add(
+                        market=cid, side=side, price="-", size=str(qty), matched="-",
+                        stage="库存退出", action="MAKER 撤单失败·不换挂",
+                        detail=f"旧卖单撤单调用失败：{exc}",
+                    )
                     return
+                try:
+                    refreshed_orders = self.api.get_open_orders()
+                except Exception as exc:
+                    logger.warning("[exit-v2] maker recancel confirmation failed: %s", exc)
+                    self._status_add(
+                        market=cid, side=side, price="-", size=str(qty), matched="-",
+                        stage="库存退出", action="MAKER 撤单未确认·不换挂",
+                        detail="无法确认撤单结果，不挂替代单",
+                    )
+                    return
+                if any(
+                    str(o.get("id", "")) in plan["cancel_ids"] for o in refreshed_orders
+                ):
+                    logger.warning(
+                        "[exit-v2] maker recancel not reconciled %s; no replacement",
+                        asset,
+                    )
+                    self._status_add(
+                        market=cid, side=side, price="-", size=str(qty), matched="-",
+                        stage="库存退出", action="MAKER 撤单未对账·不换挂",
+                        detail="旧卖单仍在挂单列表，不挂替代单",
+                    )
+                    return
+                cycle_row = cycle or self.db.get_active_exit_cycle(
+                    self.wallet_address, cid
+                )
+                if cycle_row:
+                    # Fix pack 2/3: only after CONFIRMED cancellation are the
+                    # superseded rested intents marked cancelled (fills were
+                    # already reconciled earlier in the tick).
+                    for leg in self.db.get_exit_legs(cycle_row["id"]):
+                        if (
+                            leg.get("kind") == LEG_MAKER_SELL
+                            and str(leg.get("asset_id", "")) == str(asset)
+                            and leg.get("status") == LEG_RESTED
+                        ):
+                            self.db.update_exit_leg(
+                                leg["id"], status=LEG_CANCELLED,
+                                note="superseded by repriced maker escape (cancellation confirmed)",
+                            )
+                self._record_action(
+                    cid, "exit_recancel", "-", -1, qty,
+                    "撤与持仓不符的旧卖单，改挂 MAKER 逃生价", f"cancel {len(plan['cancel_ids'])} SELL",
+                )
+            # Fix pack 3: place the replacement only for the current managed
+            # residual, freshly recomputed.
+            fresh_managed = self._managed_asset_quantities(cid, fresh=True)
+            if fresh_managed is None:
+                self._status_add(
+                    market=cid, side=side, price="-", size=str(qty), matched="-",
+                    stage="库存退出", action="MAKER 跳过（托管库存未知）",
+                    detail="托管库存无法确认，不挂替代单",
+                )
+                return
+            qty = min(float(qty), float(fresh_managed.get(asset, 0) or 0))
+            if qty <= EPSILON:
+                self._status_add(
+                    market=cid, side=side, price="-", size=str(qty), matched="-",
+                    stage="库存退出", action="MAKER 跳过（托管库存为 0）",
+                    detail="托管库存已为 0，不挂替代单",
+                )
+                return
             resp = self.api.place_post_only_sell(
                 asset, price, qty, tick_size=tick_str, neg_risk=None
             )
@@ -2156,6 +2349,39 @@ class InventoryExitEngine:
                 f"在挂 {open_qty:g}，提议 {proposed_qty:g}）"
             ),
         }
+
+    def fresh_opposite_allowed(self, condition_id, token_id, open_orders):
+        """Fresh managed unpaired residual minus fresh open opposite (fix pack 3).
+
+        Called UNDER the condition lock after cancellation confirmation: fresh
+        positions + fresh provenance replay -> CURRENT managed unpaired
+        residual -> allowed = residual - open opposite remaining.  Returns
+        ``None`` (fail-closed: place nothing) when positions / trades /
+        provenance cannot be confirmed.
+        """
+        try:
+            positions = self.api.get_user_positions(self.api.get_funder())
+        except Exception as exc:
+            logger.warning("[exit-v2] fresh opposite cap positions failed: %s", exc)
+            return None
+        try:
+            cycle = self.db.get_active_exit_cycle(self.wallet_address, condition_id)
+        except Exception as exc:
+            logger.warning("[exit-v2] fresh opposite cap cycle failed: %s", exc)
+            return None
+        if not isinstance(cycle, dict):
+            return None
+        group = positions_by_condition(positions).get(condition_id, [])
+        self._managed_cache.pop(condition_key(condition_id), None)
+        summary = self._reconcile_cycle_inventory(cycle, group)
+        if summary.get("unavailable"):
+            logger.warning(
+                "[exit-v2] fresh opposite cap: managed inventory unavailable; place nothing"
+            )
+            return None
+        residual = float(summary.get("residual_qty", 0) or 0)
+        open_qty = open_buy_qty(open_orders, token_id)
+        return max(0.0, residual - open_qty)
 
     # -- Merge runtime readiness (new-BUY gate) ---------------------------------
 

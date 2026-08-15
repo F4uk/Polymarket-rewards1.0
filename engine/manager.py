@@ -20,7 +20,6 @@ from engine.resolution import in_resolution
 from engine.tiers import tier_for
 from engine.pnl import beijing_day
 from engine.pnl_ledger import rebuild_wallet_pnl
-from engine.inventory_exit import open_buy_qty
 from utils.crypto import decrypt
 
 logger = logging.getLogger(__name__)
@@ -622,11 +621,33 @@ class WalletWorker:
                                     )
                                     proceed = False
                         if proceed:
-                            current_open = open_buy_qty(
-                                refreshed if planned_cancel else self.api.get_open_orders(),
-                                token_id,
-                            )
-                            allowed = max(0.0, residual - current_open)
+                            # Fix pack 3: recompute the CURRENT managed
+                            # unpaired residual under the lock (fresh positions
+                            # + provenance replay) before placing anything.
+                            try:
+                                fresh_orders = (
+                                    refreshed
+                                    if planned_cancel
+                                    else self.api.get_open_orders()
+                                )
+                                allowed = exit_engine.fresh_opposite_allowed(
+                                    mid, token_id, fresh_orders
+                                )
+                            except Exception as ex:
+                                logger.warning(
+                                    "opposite-cap fresh residual failed %s: %s",
+                                    token_id,
+                                    ex,
+                                )
+                                allowed = None
+                            if allowed is None:
+                                logger.warning(
+                                    "opposite-cap fresh managed residual unavailable "
+                                    "%s; place nothing",
+                                    token_id,
+                                )
+                                proceed = False
+                        if proceed:
                             placed_total = 0.0
                             for price, shares in planned_place:
                                 take = min(float(shares), allowed - placed_total)
@@ -654,13 +675,10 @@ class WalletWorker:
                                     mid, side, price, take,
                                     reason="对侧 Reward BUY 总量目标补挂",
                                 )
-                                if isinstance(resp, dict) and resp.get("orderID"):
-                                    self.db.record_bot_buy_order(
-                                        self.wallet_address,
-                                        resp["orderID"],
-                                        mid,
-                                        token_id,
-                                    )
+                                if not self._record_bot_order_or_fail(
+                                    resp, mid, token_id
+                                ):
+                                    break
                                 placed_total += take
                     finally:
                         mutation_lock.release()
@@ -728,16 +746,12 @@ class WalletWorker:
                         placed += 1
                         self._touch_active()
                         markets_with_open.add(mid)
-                        # Audit fix pack 2: persist the Reward BUY order_id as
-                        # ownership provenance (bot_buy_orders).  Only orders
-                        # placed by this application are ever auto-managed.
-                        if isinstance(resp, dict) and resp.get("orderID"):
-                            self.db.record_bot_buy_order(
-                                self.wallet_address,
-                                resp["orderID"],
-                                mid,
-                                token_id,
-                            )
+                        # Audit fix pack 2 + fix pack 3: persist the Reward BUY
+                        # order_id as ownership provenance.  A persistence
+                        # failure cancels the just-placed order and stops the
+                        # opening path (fail-closed, no untracked bot orders).
+                        if not self._record_bot_order_or_fail(resp, mid, token_id):
+                            return
                         if gap_d and gap_d.get("action") == "place":
                             self._record_place_buy_tier(
                                 mid,
@@ -769,6 +783,54 @@ class WalletWorker:
             self.db.touch_wallet_active(self.wallet_address)
         except Exception as e:
             logger.warning("touch_wallet_active failed %s: %s", self.wallet_address, e)
+
+    def _record_bot_order_or_fail(self, resp, mid, token_id) -> bool:
+        """Persist Reward BUY provenance; fail closed on DB failure (fix pack 3).
+
+        A successful placement followed by a bot_buy_orders persistence failure
+        must not leave a live untracked bot order: cancel that exact orderID,
+        confirm it is no longer open, log CRITICAL, and stop placement.  If
+        cancellation cannot be confirmed, the opening path stays fail-closed.
+        Returns False when the caller must stop placing.
+        """
+        if not (isinstance(resp, dict) and resp.get("orderID")):
+            return True
+        order_id = str(resp["orderID"])
+        try:
+            self.db.record_bot_buy_order(
+                self.wallet_address, order_id, mid, token_id
+            )
+            return True
+        except Exception as exc:
+            logger.critical(
+                "bot_buy_orders persistence failed for %s order %s; cancelling: %s",
+                token_id,
+                order_id,
+                exc,
+            )
+            try:
+                self.api.cancel_orders([order_id])
+                refreshed = self.api.get_open_orders()
+            except Exception as exc2:
+                logger.critical(
+                    "provenance-failure cancellation failed for %s: %s",
+                    order_id,
+                    exc2,
+                )
+                return False
+            if any(str(o.get("id", "")) == order_id for o in refreshed):
+                logger.critical(
+                    "provenance-failure cancellation NOT confirmed for %s; "
+                    "opening path fail-closed",
+                    order_id,
+                )
+                return False
+            logger.critical(
+                "provenance-failure order %s cancelled and confirmed; "
+                "placement stopped",
+                order_id,
+            )
+            return False
 
     def _record_place_buy_tier(
         self, market_id, side, price, shares, reason=None, price_basis=None

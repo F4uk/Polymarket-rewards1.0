@@ -19,6 +19,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -44,9 +45,11 @@ class FakeAPI:
         self.open_orders = []
         self.placed_buys = []
         self.placed_sells = []
+        self.placed_post_only_sells = []
         self.placed_market = []
         self.placed_foks = []
         self.cancelled = []
+        self.trades = {}
 
     def get_funder(self):
         return "0xFunder"
@@ -79,12 +82,35 @@ class FakeAPI:
     def place_limit_sell(self, *a, **kw):
         self.placed_sells.append(a)
 
+    def place_post_only_sell(self, *a, **kw):
+        self.placed_post_only_sells.append(a)
+
     def place_marketable_limit_sell(self, token, price, size, **kw):
         self.placed_market.append((token, price, size))
         return {"makingAmount": float(size), "takingAmount": float(size) * float(price)}
 
     def place_complement_fok_buy(self, token, size, limit, **kw):
         self.placed_foks.append((token, size, limit))
+
+    def get_trades(self, params=None):
+        return [t for values in self.trades.values() for t in values]
+
+
+def sell_fill(asset, qty, price, ts):
+    return {
+        "trade_id": f"t-{asset}-{ts}",
+        "maker_orders": [
+            {
+                "maker_address": "0xfunder",
+                "side": "SELL",
+                "asset_id": asset,
+                "price": str(price),
+                "matched_amount": str(qty),
+            }
+        ],
+        "market": CID,
+        "match_time": str(ts),
+    }
 
 
 def book(bids, asks):
@@ -129,6 +155,7 @@ def engine(db, api, costs):
         condition_lock=lambda cid: threading.Lock(),
         cost_provider=lambda asset, size, cid: (costs.get(asset, 0.30), []),
         book_provider=lambda asset: api.get_orderbook(asset),
+        readiness_checker=lambda: (True, "READY"),
     )
 
 
@@ -180,7 +207,7 @@ def main():
     eng2 = engine(db2, api2, {"no": 0.30})
     eng2.on_reward_fill(fill("no", 50, price=0.30))
     eng2.run_tick(open_orders=[], positions=[pos("NO", 50, "no")])
-    window_ok = api2.placed_sells == [("no", 0.29, 50)] and api2.placed_market == []
+    window_ok = api2.placed_post_only_sells == [("no", 0.29, 50)] and api2.placed_market == []
     # timeout: force the maker window to expire by aging the cycle.
     cycle = db2.get_active_exit_cycle("0xW", CID)
     db2.update_exit_cycle(cycle["id"], opened_at=cycle["opened_at"] - 31)
@@ -209,7 +236,8 @@ def main():
     db3.mark_merge_inventory_reconciled(op_id)
     api3.positions = [pos("YES", 10, "yes")]
     eng3.run_tick(open_orders=[], positions=[pos("YES", 10, "yes")])
-    residual_ok = api3.placed_sells == [("yes", 0.42, 10)]
+    residual_ok = api3.placed_post_only_sells == [("yes", 0.42, 10)]
+    api3.trades[CID] = [sell_fill("yes", 10, 0.42, ts=time.time() + 5)]
     api3.positions = []
     eng3.run_tick(open_orders=[], positions=[])
     closed3 = db3.get_exit_cycles(wallet="0xW", statuses=["CLOSED"])[0]
@@ -250,19 +278,23 @@ def main():
     )
     opp = eng5.authorize_placement(CID, "yes", "YES", 50, [])
     check(
-        "6. opposite scanner qty 50 while residual 20 -> effective 20",
-        opp["allowed"] is True and opp["effective_qty"] == 20,
-        f"effective={opp['effective_qty']}",
+        "6. opposite scanner qty 50 while residual 20 -> total target 20",
+        opp["allowed"] is True and opp["total_target"] == 20,
+        f"total_target={opp['total_target']}",
     )
 
     # Scenario 7: history labels render correctly.
     labels = [
-        exit_method_label([{"exit_method": "FOK+MERGE", "kind": "complement_buy"}]),
-        exit_method_label([{"exit_method": "MARKET", "kind": "market_sell"}]),
+        exit_method_label(
+            [{"exit_method": "FOK+MERGE", "kind": "complement_buy", "status": "confirmed"}]
+        ),
+        exit_method_label(
+            [{"exit_method": "MARKET", "kind": "market_sell", "status": "confirmed"}]
+        ),
         exit_method_label(
             [
-                {"exit_method": "MERGE", "kind": "merge"},
-                {"exit_method": "MAKER", "kind": "maker_sell"},
+                {"exit_method": "MERGE", "kind": "merge", "status": "done"},
+                {"exit_method": "MAKER", "kind": "maker_sell", "status": "confirmed"},
             ]
         ),
     ]

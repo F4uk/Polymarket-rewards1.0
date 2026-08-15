@@ -36,6 +36,19 @@ def test_reward_buy_is_gtc_post_only(mock_clob, _safe):
 
 @patch("api.polymarket_api.derive_deposit_address", return_value="0xSafe")
 @patch("api.polymarket_api.ClobClient")
+def test_v2_maker_escape_sell_is_gtc_post_only(mock_clob, _safe):
+    # Audit fix H: the V2 maker escape SELL must be GTC + POST-ONLY so it can
+    # never accidentally become a taker order.
+    api, client = _api(mock_clob)
+    api.place_post_only_sell("token", 0.29, 10)
+    assert client.create_and_post_order.call_args.args[2] == OrderType.GTC
+    assert client.create_and_post_order.call_args.kwargs["post_only"] is True
+    args = client.create_and_post_order.call_args.args[0]
+    assert args.side == "SELL"
+
+
+@patch("api.polymarket_api.derive_deposit_address", return_value="0xSafe")
+@patch("api.polymarket_api.ClobClient")
 def test_rejected_post_only_does_not_fallback(mock_clob, _safe):
     api, client = _api(mock_clob)
     client.create_and_post_order.return_value = {"success": False, "errorMsg": "crosses"}

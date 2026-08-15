@@ -1,6 +1,7 @@
 """V2 Fast-Exit web/config parity tests (spec §29, §47, §48)."""
 
 import math
+import time
 
 import pytest
 
@@ -261,16 +262,26 @@ def test_exit_cycle_api_returns_legs_and_method(tmp_path, monkeypatch):
 
 def test_exit_method_label_renders_mixed(tmp_path, monkeypatch):
     legs = [
-        {"exit_method": "MERGE", "kind": "merge"},
-        {"exit_method": "MAKER", "kind": "maker_sell"},
+        {"exit_method": "MERGE", "kind": "merge", "status": "done"},
+        {"exit_method": "MAKER", "kind": "maker_sell", "status": "confirmed"},
     ]
     assert exit_method_label(legs) == "MIXED"
+    # audit fix I: a rested intent alone is not a realized exit method
+    assert (
+        exit_method_label(
+            [{"exit_method": "MAKER", "kind": "maker_sell", "status": "rested"}]
+        )
+        == ""
+    )
 
 
 def test_dashboard_true_net_math_and_no_fake_zero(tmp_path, monkeypatch):
     client, db = _client(tmp_path, monkeypatch)
+    from engine.pnl import beijing_day
+
+    today = beijing_day(time.time())
     db.upsert_daily_pnl(
-        wallet="0xW", date="2026-08-14",
+        wallet="0xW", date=today,
         reward=10.0, rebate=1.0, sell_profit=3.0, loss=2.0, fee=0.0,
     )
     data = client.get("/api/dashboard").get_json()

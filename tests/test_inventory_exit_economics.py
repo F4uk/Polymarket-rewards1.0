@@ -8,10 +8,10 @@ from engine.inventory_exit import (
     choose_residual_route,
     complement_merge_recovery,
     direct_recovery,
-    effective_opposite_buy_qty,
     exit_method_label,
     maker_escape_price,
     merge_advantage,
+    opposite_total_target,
 )
 
 
@@ -179,15 +179,16 @@ def test_maker_escape_no_book_returns_none():
     assert maker_escape_price(None, None, 0.01) is None
 
 
-# --- opposite buy cap ----------------------------------------------------------
+# --- opposite buy total-target cap (audit fix D) -------------------------------
 
 
-def test_opposite_buy_cap_clamps_to_unpaired_residual():
-    assert effective_opposite_buy_qty(20, 0, 50) == 20
-    assert effective_opposite_buy_qty(20, 5, 50) == 15
-    assert effective_opposite_buy_qty(20, 20, 50) == 0
-    assert effective_opposite_buy_qty(20, 25, 50) == 0
-    assert effective_opposite_buy_qty(0, 0, 50) == 0
+def test_opposite_buy_total_target_semantics():
+    # TOTAL desired resting qty = min(proposal, unpaired residual).
+    assert opposite_total_target(20, 50) == 20
+    assert opposite_total_target(20, 10) == 10
+    assert opposite_total_target(20, 0) == 0
+    assert opposite_total_target(0, 50) == 0
+    assert opposite_total_target(0, 0) == 0
 
 
 # --- exit method labels ---------------------------------------------------------
@@ -198,10 +199,19 @@ def _leg(method, kind="market_sell"):
 
 
 def test_exit_method_labels():
-    assert exit_method_label([_leg("MERGE")]) == "MERGE"
-    assert exit_method_label([_leg("FOK+MERGE"), _leg("FOK+MERGE")]) == "FOK+MERGE"
-    assert exit_method_label([_leg("MAKER")]) == "MAKER"
-    assert exit_method_label([_leg("MARKET")]) == "MARKET"
-    assert exit_method_label([_leg("MERGE"), _leg("MARKET")]) == "MIXED"
-    assert exit_method_label([_leg("")]) == ""
+    def _done(method, kind="market_sell"):
+        return {"exit_method": method, "kind": kind, "status": "confirmed"}
+
+    def _rested(method, kind="maker_sell"):
+        return {"exit_method": method, "kind": kind, "status": "rested"}
+
+    assert exit_method_label([_done("MERGE", "merge")]) == "MERGE"
+    assert exit_method_label([_done("FOK+MERGE", "complement_buy"), _done("FOK+MERGE", "merge")]) == "FOK+MERGE"
+    assert exit_method_label([_done("MAKER", "maker_sell")]) == "MAKER"
+    assert exit_method_label([_done("MARKET", "market_sell")]) == "MARKET"
+    assert exit_method_label([_done("MERGE", "merge"), _done("MARKET", "market_sell")]) == "MIXED"
+    # audit fix I: rested intent never counts as a realized exit method
+    assert exit_method_label([_rested("MAKER", "maker_sell")]) == ""
+    assert exit_method_label([_rested("MAKER"), _done("MARKET")]) == "MARKET"
+    assert exit_method_label([_done("")]) == ""
     assert exit_method_label([]) == ""

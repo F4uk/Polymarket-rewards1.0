@@ -107,3 +107,32 @@ def extract_buy_fills(trades: list[dict], funder: str, asset_id: str) -> list[di
         for f in extract_fills(trades, funder, asset_id)
         if f["side"] == "BUY"
     ]
+
+
+def bot_buy_fills(trades: list[dict], funder: str) -> list[dict]:
+    """Our maker BUY fills flattened WITH order_id (ownership provenance).
+
+    Used by the Inventory Exit Engine to prove that inventory belongs to this
+    application: a fill is only bot-managed when its ``order_id`` matches a
+    Reward BUY order the application itself persisted (bot_buy_orders).  This
+    helper deliberately does not change ``extract_fills``' output shape.
+    """
+    f = (funder or "").lower()
+    out = []
+    for tr in trades or []:
+        ts = float(tr.get("match_time", 0) or 0)
+        for mo in tr.get("maker_orders", []) or []:
+            if str(mo.get("maker_address", "")).lower() != f:
+                continue
+            if str(mo.get("side", "")).upper() != "BUY":
+                continue
+            out.append(
+                {
+                    "order_id": mo.get("order_id", ""),
+                    "asset_id": mo.get("asset_id", ""),
+                    "price": float(mo.get("price", 0) or 0),
+                    "size": float(mo.get("matched_amount", 0) or 0),
+                    "ts": ts,
+                }
+            )
+    return out

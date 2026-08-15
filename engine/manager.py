@@ -20,6 +20,7 @@ from engine.resolution import in_resolution
 from engine.tiers import tier_for
 from engine.pnl import beijing_day
 from engine.pnl_ledger import rebuild_wallet_pnl
+from engine.inventory_exit import open_buy_qty
 from utils.crypto import decrypt
 
 logger = logging.getLogger(__name__)
@@ -281,7 +282,7 @@ class WalletWorker:
         # 快速通过,不发网络探测。
         exit_engine = self.monitor.exit_engine()
         if exit_engine is not None:
-            merge_ready, merge_reason = exit_engine.merge_runtime_ready()
+            merge_ready, merge_reason = exit_engine.new_opening_gate_ready()
             if not merge_ready:
                 logger.info(
                     "[exit-v2] Merge 未就绪(%s)：暂停 %s 新开仓",
@@ -542,16 +543,20 @@ class WalletWorker:
                     cancel_reason = "库存退出中·同侧禁买:" + authority["reason"]
                     cancel_action = "exit_inventory_cancel"
                 elif authority is not None and authority.get("kind") == "opposite_cap":
-                    # Audit fix D: 对侧 Reward BUY 的「总量目标」语义——总在挂量
-                    # 必须 <= 当前未配对残差。desired = min(残差, max(提议, 在挂)):
-                    # 残差收缩时把在挂量收敛下来、残差为 0 时撤光、残差充足时按提议
-                    # 补到目标总量。reconcile_buy_orders 负责撤改到目标 ladder。
+                    # Audit fix D + fix pack 2 (atomic fail-closed): 对侧 Reward
+                    # BUY 的「总量目标」语义。reconcile_buy_orders 给出撤改计划,
+                    # 但**撤单未确认前绝不挂替代单**:撤单调用失败 -> 什么都不挂;
+                    # 撤单后重取挂单仍见旧单 -> 什么都不挂;确认后才按当前在挂量
+                    # 重算剩余允许量,只在允许量内补挂。硬不变量:每次变更后
+                    # OPEN 对侧剩余 <= 当前未配对残差。
                     residual = float(authority.get("residual", 0) or 0)
-                    open_total = float(authority.get("open_qty", 0) or 0)
                     proposal_total = sum(
                         float(s) for _p, s in ladders.get(key, [])
                     )
-                    desired = min(residual, max(proposal_total, open_total))
+                    desired = min(
+                        residual,
+                        max(proposal_total, float(authority.get("open_qty", 0) or 0)),
+                    )
                     capped = []
                     remaining = desired
                     for price, shares in ladders.get(key, []):
@@ -561,9 +566,104 @@ class WalletWorker:
                         remaining -= take
                         if remaining <= 0:
                             break
-                    cancel_ids, to_place = reconcile_buy_orders(capped, resting)
-                    cancel_reason = "对侧 Reward BUY 总量收敛到未配对残差:" + authority["reason"]
-                    cancel_action = "opposite_cap_reconcile"
+                    planned_cancel, planned_place = reconcile_buy_orders(
+                        capped, resting
+                    )
+                    cancel_ids, to_place = [], []
+                    mutation_lock = self._condition_lock(mid)
+                    if not mutation_lock.acquire(blocking=False):
+                        continue
+                    try:
+                        proceed = True
+                        if planned_cancel:
+                            try:
+                                self.api.cancel_orders(planned_cancel)
+                                self.db.record_action(
+                                    wallet=self.wallet_address,
+                                    market_id=mid,
+                                    action_type="opposite_cap_reconcile",
+                                    side="-",
+                                    price=-1,
+                                    size=0,
+                                    reason=(
+                                        "对侧 Reward BUY 总量收敛到未配对残差:"
+                                        + authority["reason"]
+                                    ),
+                                    price_basis=(
+                                        f"撤 {len(planned_cancel)} 笔 BUY；"
+                                        "来源：CLOB get_open_orders"
+                                    ),
+                                )
+                            except Exception as ex:
+                                logger.warning(
+                                    "opposite-cap cancel %s failed; no replacement: %s",
+                                    token_id,
+                                    ex,
+                                )
+                                proceed = False
+                        if proceed and planned_cancel:
+                            try:
+                                refreshed = self.api.get_open_orders()
+                            except Exception as ex:
+                                logger.warning(
+                                    "opposite-cap cancel confirmation failed %s: %s",
+                                    token_id,
+                                    ex,
+                                )
+                                proceed = False
+                            else:
+                                if any(
+                                    o.get("id") in planned_cancel for o in refreshed
+                                ):
+                                    logger.warning(
+                                        "opposite-cap cancellation not reconciled "
+                                        "%s; no replacement placed",
+                                        token_id,
+                                    )
+                                    proceed = False
+                        if proceed:
+                            current_open = open_buy_qty(
+                                refreshed if planned_cancel else self.api.get_open_orders(),
+                                token_id,
+                            )
+                            allowed = max(0.0, residual - current_open)
+                            placed_total = 0.0
+                            for price, shares in planned_place:
+                                take = min(float(shares), allowed - placed_total)
+                                if take <= 0:
+                                    break
+                                try:
+                                    resp = self.api.place_limit_buy(
+                                        token_id,
+                                        price,
+                                        take,
+                                        tick_size=side["tick_size_str"],
+                                        neg_risk=None,
+                                    )
+                                except Exception as ex:
+                                    logger.error(
+                                        "opposite-cap replacement buy failed %s: %s",
+                                        token_id,
+                                        ex,
+                                    )
+                                    break
+                                placed += 1
+                                self._touch_active()
+                                markets_with_open.add(mid)
+                                self._record_place_buy_tier(
+                                    mid, side, price, take,
+                                    reason="对侧 Reward BUY 总量目标补挂",
+                                )
+                                if isinstance(resp, dict) and resp.get("orderID"):
+                                    self.db.record_bot_buy_order(
+                                        self.wallet_address,
+                                        resp["orderID"],
+                                        mid,
+                                        token_id,
+                                    )
+                                placed_total += take
+                    finally:
+                        mutation_lock.release()
                 elif token_id in held_assets or self.db.is_side_paused(
                     self.wallet_address, mid, token_id
                 ) is True:
@@ -614,7 +714,7 @@ class WalletWorker:
                         # leave its inventory/order reconciliation untouched.
                         break
                     try:
-                        self.api.place_limit_buy(
+                        resp = self.api.place_limit_buy(
                             token_id,
                             price,
                             shares,
@@ -628,6 +728,16 @@ class WalletWorker:
                         placed += 1
                         self._touch_active()
                         markets_with_open.add(mid)
+                        # Audit fix pack 2: persist the Reward BUY order_id as
+                        # ownership provenance (bot_buy_orders).  Only orders
+                        # placed by this application are ever auto-managed.
+                        if isinstance(resp, dict) and resp.get("orderID"):
+                            self.db.record_bot_buy_order(
+                                self.wallet_address,
+                                resp["orderID"],
+                                mid,
+                                token_id,
+                            )
                         if gap_d and gap_d.get("action") == "place":
                             self._record_place_buy_tier(
                                 mid,

@@ -438,14 +438,31 @@ class InventoryExitEngine:
     # -- cycle lifecycle ------------------------------------------------------
 
     def on_reward_fill(self, ev: dict) -> None:
-        """Create or join the (wallet, condition) exit cycle for a Reward BUY fill."""
+        """Create or join the exit cycle for a PROVEN bot Reward BUY fill.
+
+        Audit fix pack 2: ownership is traceable to the order_id this
+        application persisted when it placed the Reward BUY (bot_buy_orders).
+        A manual CLOB BUY from the same funder has no bot order provenance and
+        is displayed UNMANAGED — never auto-managed.
+        """
         cid = ev.get("market", "")
         asset_id = ev.get("asset_id", "")
         size = float(ev.get("size", 0) or 0)
         price = float(ev.get("price", 0) or 0)
+        order_id = str(ev.get("order_id") or "")
         if not cid or size <= 0:
             return
         try:
+            if not self.db.is_bot_buy_order(self.wallet_address, order_id):
+                self._status_add(
+                    market=cid, side="买入", price=f"{price:.4f}",
+                    size=str(size), matched=str(size),
+                    stage="库存退出",
+                    action="⚠️UNMANAGED·成交无机器人订单证据",
+                    detail=f"order_id={order_id[:10]}… 不在 bot_buy_orders；"
+                    "不自动管理（可能是同 funder 手工买入）",
+                )
+                return
             outcome = self._token_outcome(asset_id, cid)
             existing = self.db.get_active_exit_cycle(self.wallet_address, cid)
             if existing:
@@ -454,6 +471,8 @@ class InventoryExitEngine:
                     json.loads(existing.get("held_assets_json") or "[]")
                 )
                 held_assets.add(asset_id)
+                owned_map = json.loads(existing.get("owned_by_asset_json") or "{}")
+                owned_map[asset_id] = float(owned_map.get(asset_id, 0) or 0) + size
                 self.db.update_exit_cycle(
                     cycle_id,
                     status=CYCLE_ACTIVE,
@@ -462,6 +481,7 @@ class InventoryExitEngine:
                     held_side=outcome or existing.get("held_side", ""),
                     held_asset_id=asset_id or existing.get("held_asset_id", ""),
                     held_assets_json=json.dumps(sorted(held_assets)),
+                    owned_by_asset_json=json.dumps(owned_map),
                     error="",
                 )
             else:
@@ -472,6 +492,7 @@ class InventoryExitEngine:
                     held_side=outcome,
                     held_asset_id=asset_id,
                     held_assets_json=json.dumps([asset_id]),
+                    owned_by_asset_json=json.dumps({asset_id: size}),
                     qty=size,
                 )
             self.db.add_exit_leg(
@@ -484,7 +505,7 @@ class InventoryExitEngine:
                 qty=size,
                 price=price,
                 collateral=-(size * price),
-                order_id=str(ev.get("order_id") or ""),
+                order_id=order_id,
                 note=f"reward fill trade={ev.get('trade_id', '')}",
             )
             self._status_add(
@@ -654,6 +675,7 @@ class InventoryExitEngine:
                 condition_key(c["condition_id"])
                 for c in self.db.get_non_closed_exit_cycles(self.wallet_address)
             }
+            bot_order_ids = self.db.get_bot_buy_order_ids(self.wallet_address)
             closed_by_condition: dict[str, list[dict]] = {}
             for row in self.db.get_exit_cycles(
                 wallet=self.wallet_address, statuses=[CYCLE_CLOSED]
@@ -661,6 +683,7 @@ class InventoryExitEngine:
                 closed_by_condition.setdefault(
                     condition_key(row["condition_id"]), []
                 ).append(row)
+            confirmed_merges = self.db.get_confirmed_merges(self.wallet_address)
         except Exception:
             return
         for cid, group in by_condition.items():
@@ -674,37 +697,44 @@ class InventoryExitEngine:
                 continue
             # Evidence side: residual side when one-sided, else YES.
             if summary["residual_side"]:
-                side, asset, side_qty = (
+                side, asset = (
                     summary["residual_side"],
                     summary["residual_asset"],
-                    summary["yes_qty"]
-                    if summary["residual_side"] == "YES"
-                    else summary["no_qty"],
                 )
             else:
-                side, asset, side_qty = "YES", summary["yes_asset"], summary["yes_qty"]
-            if not asset or side_qty <= 0:
+                side, asset = "YES", summary["yes_asset"]
+            if not asset:
                 continue
-            cost, lots = self._cost(asset, side_qty, cid)
-            if cost is None or cost <= 0:
-                # No bot ownership evidence: never auto-trade this inventory.
+            owned = self._bot_owned_quantities(cid, bot_order_ids, confirmed_merges)
+            if not owned:
+                # No bot-order provenance: never auto-trade this inventory.
                 self._status_add(
-                    market=cid, side=side, price="-", size=str(side_qty),
+                    market=cid, side=side, price="-", size=str(summary["total"]),
                     matched="-", stage="库存退出",
                     action="⚠️UNMANAGED·无机器人成交证据",
-                    detail="CLOB 成交无法重建机器人所有权；不自动卖出/补边/Merge，等待人工处理",
+                    detail="成交 order_id 均不在 bot_buy_orders（无应用下单证据）；"
+                    "不自动卖出/补边/Merge，等待人工处理",
                 )
                 self._record_action(
-                    cid, "exit_unmanaged_inventory", "-", -1, side_qty,
-                    "未托管库存：无机器人 Reward BUY 成交证据，V2 不自动交易",
-                    "证据来源：CLOB get_trades + FIFO 重建（禁用 Data API avgPrice）",
+                    cid, "exit_unmanaged_inventory", "-", -1, summary["total"],
+                    "未托管库存：成交 order_id 无 bot_buy_orders 证据，V2 不自动交易",
+                    "证据来源：CLOB get_trades maker BUY order_id 比对",
                 )
                 continue
             prior = closed_by_condition.get(key, [])
-            max_fill_ts = max(
-                (float(l.get("ts", 0) or 0) for l in lots),
-                default=0.0,
-            )
+            trades = self._trades(cid)
+            max_fill_ts = 0.0
+            if trades is not None:
+                from engine.fills import bot_buy_fills
+
+                max_fill_ts = max(
+                    (
+                        float(f.get("ts", 0) or 0)
+                        for f in bot_buy_fills(trades, self.api.get_funder())
+                        if str(f.get("order_id", "")) in bot_order_ids
+                    ),
+                    default=0.0,
+                )
             latest_close = max(
                 (float(c.get("closed_at", 0) or 0) for c in prior),
                 default=0.0,
@@ -712,11 +742,23 @@ class InventoryExitEngine:
             if prior and max_fill_ts <= latest_close:
                 # Inventory predates the previous cycle's close: stale Data API.
                 self._status_add(
-                    market=cid, side=side, price="-", size=str(side_qty),
+                    market=cid, side=side, price="-", size=str(summary["total"]),
                     matched="-", stage="库存退出",
                     action="陈旧库存（上次周期已关闭）",
                     detail="持仓证据早于上次周期关闭时间，等待 Data API 收敛；不重开周期",
                 )
+                continue
+            owned_map = {}
+            for a, q in owned.items():
+                if a not in (summary["yes_asset"], summary["no_asset"]) or q <= 0:
+                    continue
+                position_qty = (
+                    summary["yes_qty"]
+                    if a == summary["yes_asset"]
+                    else summary["no_qty"]
+                )
+                owned_map[a] = min(float(q), float(position_qty))
+            if not owned_map:
                 continue
             try:
                 trigger = "recovered_offline_fill" if prior else "adopt_legacy"
@@ -731,17 +773,87 @@ class InventoryExitEngine:
                             a for a in (summary["yes_asset"], summary["no_asset"]) if a
                         )
                     ),
+                    owned_by_asset_json=json.dumps(owned_map),
                     qty=summary["residual_qty"] or summary["total"],
                     paired_qty=summary["paired"],
                 )
                 self._record_action(
                     cid, "exit_cycle_opened", "-", -1, summary["total"],
-                    f"V2 {trigger}：机器人成交证据确认所有权，开启库存退出周期",
-                    f"evidence_side={side} residual={summary['residual_qty']:g} "
+                    f"V2 {trigger}：bot_buy_orders 证据确认所有权，开启库存退出周期",
+                    f"owned={owned_map} residual={summary['residual_qty']:g} "
                     f"paired={summary['paired']:g}",
                 )
             except ActiveExitCycleExists:
                 continue
+
+    def _bot_owned_quantities(
+        self, cid, bot_order_ids: set, confirmed_merges: list[dict]
+    ) -> dict:
+        """Provably bot-owned shares per asset (audit fix pack 2).
+
+        Replays bot-order BUY fills (order_id persisted in bot_buy_orders)
+        against our SELL fills and confirmed Merge consumption with FIFO.
+        Manual CLOB BUY fills from the same funder never enter the queue.
+        Returns {asset_id: qty}.
+        """
+        trades = self._trades(cid)
+        if not trades:
+            return {}
+        try:
+            funder = self.api.get_funder()
+        except Exception:
+            return {}
+        from engine.fills import bot_buy_fills
+        from engine.take_profit import remaining_fifo_lots
+
+        bot_buys = [
+            f
+            for f in bot_buy_fills(trades, funder)
+            if str(f.get("order_id", "")) in bot_order_ids
+        ]
+        assets = {
+            str(f.get("asset_id", "") or "")
+            for f in bot_buys
+            if f.get("asset_id")
+        }
+        owned_assets: dict[str, float] = {}
+        for asset in assets:
+            events = [
+                {
+                    "side": "BUY",
+                    "size": float(f.get("size", 0) or 0),
+                    "price": float(f.get("price", 0) or 0),
+                    "ts": float(f.get("ts", 0) or 0),
+                }
+                for f in bot_buys
+                if str(f.get("asset_id", "")) == asset
+            ]
+            for sf in extract_fills(trades, funder, asset):
+                if sf["side"] == "SELL":
+                    events.append(
+                        {"side": "SELL", "size": sf["size"], "ts": sf["ts"]}
+                    )
+            for op in confirmed_merges:
+                for consumed in op.get("consumed_lots", []) or []:
+                    if consumed.get("asset_id") != asset:
+                        continue
+                    qty = sum(
+                        float(lot.get("take", 0) or 0)
+                        for lot in consumed.get("lots", []) or []
+                    )
+                    if qty > 0:
+                        events.append(
+                            {
+                                "side": "MERGE",
+                                "size": qty,
+                                "ts": op.get("confirmed_at") or op.get("created_at") or 0,
+                            }
+                        )
+            lots = remaining_fifo_lots(events)
+            qty = sum(float(l.get("remaining", 0) or 0) for l in lots)
+            if qty > 0:
+                owned_assets[asset] = qty
+        return owned_assets
 
     def _route_cycle(
         self, cycle, group, open_orders, resolving: set, low_balance: bool, tmpl: dict
@@ -809,7 +921,7 @@ class InventoryExitEngine:
         merge_eligible = self._merge_capable(tmpl)
         merge_ready = False
         if merge_eligible:
-            merge_ready, _ = self.merge_runtime_ready()
+            merge_ready, _ = self.merge_execution_ready()
         merge_capable = merge_eligible and merge_ready
 
         if summary["paired"] > 0 and merge_capable:
@@ -829,36 +941,51 @@ class InventoryExitEngine:
         # Build the sides that must be routed.  With automatic Merge actually
         # executable the pair is reserved above; otherwise (audit fix G) BOTH
         # owned sides exit through non-Merge handling instead of freezing.
+        # Audit fix pack 2: per-asset owned quantity caps each side — a mixed
+        # position (bot + manual on the same token) owns at most the proven qty.
+        owned_map = json.loads(cycle.get("owned_by_asset_json") or "{}")
         sides = []
         if summary["yes_qty"] > EPSILON and summary["yes_asset"]:
-            sides.append(
-                {"side": "YES", "asset": summary["yes_asset"], "qty": summary["yes_qty"]}
+            qty = min(
+                summary["yes_qty"],
+                float(owned_map.get(summary["yes_asset"], summary["yes_qty"]) or 0),
             )
+            if qty > EPSILON:
+                sides.append({"side": "YES", "asset": summary["yes_asset"], "qty": qty})
         if summary["no_qty"] > EPSILON and summary["no_asset"]:
-            sides.append(
-                {"side": "NO", "asset": summary["no_asset"], "qty": summary["no_qty"]}
+            qty = min(
+                summary["no_qty"],
+                float(owned_map.get(summary["no_asset"], summary["no_qty"]) or 0),
             )
+            if qty > EPSILON:
+                sides.append({"side": "NO", "asset": summary["no_asset"], "qty": qty})
         if not sides:
             self.db.update_exit_cycle(cycle["id"], status=CYCLE_ACTIVE, selected_route="NOOP")
             return
         held_assets = sorted(s["asset"] for s in sides)
-        # Per-asset CLOSING guard: a pending mutation on one asset must not
-        # freeze the other side of the same condition.
-        blocked = [s for s in sides if self._closing_blocks_side(cycle, s["asset"], now)]
-        if blocked:
+        # Audit fix pack 2: per-asset CLOSING isolation — a pending mutation on
+        # one asset must NOT freeze the other side of the same condition.
+        # Condition-wide Merge/FOK barriers stay condition-wide (handled above);
+        # the ordinary direct/Maker mutation guard is per asset.
+        sides_to_route = [
+            s for s in sides if not self._closing_blocks_side(cycle, s["asset"], now)
+        ]
+        blocked = [s for s in sides if s not in sides_to_route]
+        for b in blocked:
             self._status_add(
-                market=cid, side=blocked[0]["side"], price="-",
-                size=str(blocked[0]["qty"]), matched="-",
+                market=cid, side=b["side"], price="-",
+                size=str(b["qty"]), matched="-",
                 stage="库存退出", action="CLOSING·等待库存收敛",
                 detail="上一笔退出变更待 Data API 确认，禁止重复退出",
             )
+        if not sides_to_route:
             return
-        if cycle.get("status") == CYCLE_CLOSING:
+        if cycle.get("status") == CYCLE_CLOSING and not blocked:
             # stale CLOSING (no fresh pending mutation, no barrier): re-route.
             self.db.update_exit_cycle(cycle["id"], status=CYCLE_ACTIVE, error="")
 
         routes = []
-        for s in sides:
+        for s in sides_to_route:
             route = self._route_one_side(
                 cycle, cid, s["side"], s["asset"], s["qty"], tmpl, open_orders,
                 resolving, low_balance, now, merge_capable,
@@ -881,6 +1008,10 @@ class InventoryExitEngine:
             )
         else:
             aggregate_status, aggregate_route = CYCLE_ACTIVE, "NOOP"
+        if blocked:
+            # A side is still awaiting Data API convergence: keep the cycle
+            # CLOSING even when the other side routed successfully.
+            aggregate_status = CYCLE_CLOSING
         current = self.db.get_exit_cycle(cycle["id"]) or cycle
         current_error = str(current.get("error", "") or "")
         if aggregate_status == CYCLE_BLOCKED and not current_error:
@@ -897,11 +1028,11 @@ class InventoryExitEngine:
 
     def _closing_blocks_side(self, cycle: dict, asset: str, now: float) -> bool:
         """True when a fresh pending mutation on this asset forbids re-routing."""
-        if cycle.get("status") != CYCLE_CLOSING:
-            return False
         pending_map = self._exit_pending.get(cycle["id"], {})
         if pending_map.get(asset, 0.0) > now:
             return True
+        if cycle.get("status") != CYCLE_CLOSING:
+            return False
         if not pending_map:
             # Restart case: a recent CLOSING with no in-memory markers waits
             # out the grace window before being treated as stale.
@@ -1056,6 +1187,7 @@ class InventoryExitEngine:
             leg.get("kind") == LEG_COMPLEMENT_BUY for leg in legs
         )
         opened = float(cycle.get("opened_at", 0) or 0)
+        confirmed_any = False
         for op in ops:
             cid = op.get("condition_id", "")
             if condition_key(cid) != condition_key(cycle["condition_id"]):
@@ -1079,27 +1211,33 @@ class InventoryExitEngine:
                     note=f"confirmed merge op {op_id} pnl={op.get('realized_pnl')}",
                     created_at=float(op.get("confirmed_at", 0) or 0) or None,
                 )
+                confirmed_any = True
                 if method == "FOK+MERGE":
-                    # Audit fix I: the confirmed Merge proves the complement was
-                    # bought.  Realize the pending complement leg (its signed
-                    # worst limit is the conservative cost bound; the CLOB fill
-                    # reconciliation refines the actual price when visible).
+                    # Audit fix pack 2: Merge confirmation proves the complement
+                    # was bought, but the signed worst limit is protection, NOT
+                    # the realized cost.  Leave the complement leg pending: the
+                    # fill reconciliation refines it to the actual CLOB BUY fill
+                    # price when visible; only after the ledger grace does the
+                    # explicitly-labelled conservative bound take effect.
                     for leg in legs:
                         if (
                             leg.get("kind") == LEG_COMPLEMENT_BUY
                             and leg.get("status") == LEG_PENDING
                             and condition_key(leg.get("condition_id", "")) == condition_key(cid)
                         ):
-                            leg_qty = float(leg.get("qty", 0) or 0)
-                            leg_price = float(leg.get("price", 0) or 0)
                             self.db.update_exit_leg(
                                 leg["id"],
-                                status=LEG_CONFIRMED,
-                                collateral=-(leg_qty * leg_price),
-                                note=f"{leg.get('note', '')} | confirmed by merge op {op_id}",
+                                note=(
+                                    f"{leg.get('note', '')} | merge op {op_id} "
+                                    "confirmed; awaiting actual CLOB fill price"
+                                ),
                             )
             except Exception as exc:
                 logger.warning("[exit-v2] merge leg record failed %s: %s", op_id, exc)
+        if confirmed_any:
+            # The accepted/indeterminate-FOK barrier is resolved by the
+            # confirmed Merge: clear it so the cycle can reconcile and close.
+            self._pending_fok_until.pop(condition_key(cycle["condition_id"]), None)
 
     def _confirm_exit_legs(self, cycle: dict) -> tuple[bool, bool]:
         """Reconcile pending/rested exit legs against authoritative CLOB fills.
@@ -1156,38 +1294,60 @@ class InventoryExitEngine:
                 for f in fills
                 if float(f.get("size", 0) or 0) > 0
             ]
-            # Time-window attribution: a fill belongs to the leg that was the
-            # active intent at that moment (leg created_at .. next same-direction
-            # leg created_at).  A superseded maker rest never captures the later
-            # market FAK fill.  Windows are built from ALL legs of the asset
-            # (confirmed ones included), so a pending leg can never extend its
-            # window past a later leg merely because that leg already confirmed.
+            # Cursor-FIFO attribution (fix pack 2): the fill stream is the full
+            # per-direction history since the cycle opened.  Legs consume the
+            # stream in creation order — confirmed legs have already consumed
+            # their qty, cancelled legs consume nothing, and each pending leg
+            # claims the next chunk.  Superseded rests are marked cancelled at
+            # supersession time, so they never capture a later market FAK fill.
             ordered = sorted(
                 all_by_asset.get(asset, []),
                 key=lambda leg: float(leg.get("created_at", 0) or 0),
             )
-            for idx, leg in enumerate(ordered):
+            # Confirmed legs of the SAME direction have already consumed the
+            # front of the fill stream; cancelled legs consumed nothing
+            # (superseded orders).  A confirmed MERGE leg is not part of the
+            # BUY/SELL fill stream and never advances it.
+            skip_by_direction = {
+                "BUY": sum(
+                    float(l.get("qty", 0) or 0)
+                    for l in ordered
+                    if l.get("status") in (LEG_CONFIRMED, LEG_DONE)
+                    and l.get("kind") == LEG_COMPLEMENT_BUY
+                ),
+                "SELL": sum(
+                    float(l.get("qty", 0) or 0)
+                    for l in ordered
+                    if l.get("status") in (LEG_CONFIRMED, LEG_DONE)
+                    and l.get("kind") in (LEG_MAKER_SELL, LEG_MARKET_SELL)
+                ),
+            }
+            for leg in ordered:
+                status = leg.get("status")
+                if status in (LEG_CONFIRMED, LEG_DONE):
+                    continue
+                if status in (LEG_CANCELLED, LEG_FAILED):
+                    continue
                 wanted = float(leg.get("qty", 0) or 0)
                 if wanted <= 0:
                     continue
-                start = float(leg.get("created_at", 0) or 0) - 2.0
-                end = (
-                    float(ordered[idx + 1].get("created_at", 0) or 0)
-                    if idx + 1 < len(ordered)
-                    else float("inf")
-                )
                 want_side = (
                     "BUY"
                     if leg.get("kind") == LEG_COMPLEMENT_BUY
                     else "SELL"
                 )
+                skip = skip_by_direction.get(want_side, 0.0)
                 taken, total_price = 0.0, 0.0
                 for f in budget:
                     if f["side"] != want_side or f["size"] <= 0:
                         continue
-                    if not (start <= f["ts"] < end):
-                        continue
-                    use = min(wanted - taken, f["size"])
+                    if skip > 0:
+                        used_skip = min(f["size"], skip)
+                        f["size"] -= used_skip
+                        skip -= used_skip
+                        if f["size"] <= 0:
+                            continue
+                    use = min(f["size"], wanted - taken)
                     if use <= 0:
                         continue
                     taken += use
@@ -1218,6 +1378,39 @@ class InventoryExitEngine:
                     continue
                 filled_any = True
                 if taken < wanted - 1e-6:
+                    # Audit fix pack 2: a partial fill must NOT overwrite the
+                    # only leg and lose the remainder.  The realized portion is
+                    # confirmed on this leg; the unfilled remainder is preserved
+                    # as its own rested/pending leg so a later fill is
+                    # attributed exactly once.
+                    remainder = wanted - taken
+                    remainder_status = (
+                        LEG_RESTED
+                        if leg.get("kind") == LEG_MAKER_SELL
+                        else LEG_PENDING
+                    )
+                    try:
+                        self.db.add_exit_leg(
+                            cycle["id"],
+                            self.wallet_address,
+                            cycle["condition_id"],
+                            leg.get("kind"),
+                            asset_id=asset,
+                            side=leg.get("side", ""),
+                            qty=remainder,
+                            price=float(leg.get("price", 0) or 0),
+                            collateral=0.0,
+                            exit_method=leg.get("exit_method", ""),
+                            status=remainder_status,
+                            note=(
+                                f"remainder of leg {leg['id']} after partial "
+                                f"fill {taken:g}"
+                            ),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[exit-v2] remainder leg failed %s: %s", leg["id"], exc
+                        )
                     still_pending = True
         return filled_any, still_pending
 
@@ -1276,13 +1469,28 @@ class InventoryExitEngine:
                 if still:
                     age = time.time() - float(cycle.get("closed_at", time.time()) or time.time())
                     if age >= LEDGER_RECONCILE_GRACE_SEC:
-                        # Unfilled remainder of superseded orders never filled:
-                        # cancel it so the cycle can be finalized.
+                        # Grace expired.  Complement legs are proven bought by
+                        # the confirmed Merge: retain the explicitly-labelled
+                        # conservative bound (signed FOK worst limit).  Other
+                        # unfilled remainders (superseded orders) never filled:
+                        # cancel them so the cycle can be finalized.
                         for l in still:
-                            self.db.update_exit_leg(
-                                l["id"], status=LEG_CANCELLED,
-                                note="no confirmed fill within ledger grace; unfilled remainder",
-                            )
+                            if l.get("kind") == LEG_COMPLEMENT_BUY:
+                                leg_qty = float(l.get("qty", 0) or 0)
+                                leg_price = float(l.get("price", 0) or 0)
+                                self.db.update_exit_leg(
+                                    l["id"], status=LEG_CONFIRMED,
+                                    collateral=-(leg_qty * leg_price),
+                                    note=(
+                                        f"{l.get('note', '')} | conservative bound "
+                                        "retained: actual CLOB fill unseen within grace"
+                                    ),
+                                )
+                            else:
+                                self.db.update_exit_leg(
+                                    l["id"], status=LEG_CANCELLED,
+                                    note="no confirmed fill within ledger grace; unfilled remainder",
+                                )
                         self._finalize_cycle(cycle)
                     continue
                 self._finalize_cycle(cycle)
@@ -1328,7 +1536,7 @@ class InventoryExitEngine:
             # TTL cache; immediately before the funds-moving FOK we force a
             # fresh read-only validation (Type3 + trading + credentials +
             # expected Deposit Wallet == funder + authenticated nonce).
-            ready, reason = self.merge_runtime_ready(force=True)
+            ready, reason = self.merge_execution_ready(force=True)
             if not ready:
                 cycle_row = self.db.get_active_exit_cycle(self.wallet_address, cid)
                 if cycle_row:
@@ -1606,6 +1814,20 @@ class InventoryExitEngine:
                         cid, "exit_cancel_sell", "-", -1, qty,
                         "受保护直卖前撤掉在挂卖单", f"cancel {len(sell_ids)} SELL",
                     )
+                    if cycle_row:
+                        # Fix pack 2: the resting maker intents being cancelled
+                        # must never later capture the FAK fill — persist their
+                        # supersession now.
+                        for leg in self.db.get_exit_legs(cycle_row["id"]):
+                            if (
+                                leg.get("kind") == LEG_MAKER_SELL
+                                and str(leg.get("asset_id", "")) == str(asset)
+                                and leg.get("status") in (LEG_RESTED, LEG_PENDING)
+                            ):
+                                self.db.update_exit_leg(
+                                    leg["id"], status=LEG_CANCELLED,
+                                    note="superseded by protected direct exit",
+                                )
                 except Exception as exc:
                     # Audit fix B: a failed cancellation call must never be
                     # followed by a FAK against reserved inventory.
@@ -1758,6 +1980,23 @@ class InventoryExitEngine:
             if plan["cancel_ids"]:
                 try:
                     self.api.cancel_orders(plan["cancel_ids"])
+                    cycle_row = cycle or self.db.get_active_exit_cycle(
+                        self.wallet_address, cid
+                    )
+                    if cycle_row:
+                        # Fix pack 2: repriced rests are superseded intents —
+                        # they never filled and must never capture the new
+                        # order's fills.
+                        for leg in self.db.get_exit_legs(cycle_row["id"]):
+                            if (
+                                leg.get("kind") == LEG_MAKER_SELL
+                                and str(leg.get("asset_id", "")) == str(asset)
+                                and leg.get("status") == LEG_RESTED
+                            ):
+                                self.db.update_exit_leg(
+                                    leg["id"], status=LEG_CANCELLED,
+                                    note="superseded by repriced maker escape",
+                                )
                     self._record_action(
                         cid, "exit_recancel", "-", -1, qty,
                         "撤与持仓不符的旧卖单，改挂 MAKER 逃生价", f"cancel {len(plan['cancel_ids'])} SELL",
@@ -1920,20 +2159,21 @@ class InventoryExitEngine:
 
     # -- Merge runtime readiness (new-BUY gate) ---------------------------------
 
-    def merge_runtime_ready(self, force: bool = False) -> tuple[bool, str]:
-        """(ready, reason) for automatic-Merge runtime capability.
+    def merge_execution_ready(self, force: bool = False) -> tuple[bool, str]:
+        """(ready, reason) for funds-moving Merge/FOK+Merge execution.
 
-        The gate is only meaningful for Type3 wallets whose template enables
-        fast_exit + merge + require_merge_ready_for_new_buys; Type1/Type2 and
-        gate-off templates return (True, '').  ``force=True`` bypasses the
-        short TTL cache (audit fix C): immediately before a funds-moving
+        ALWAYS validates (audit fix pack 2): Type3 + trading enabled +
+        credentials configured/decryptable + expected Deposit Wallet == funder
+        + authenticated read-only Relayer nonce.  It has NO dependency on
+        ``require_merge_ready_for_new_buys`` — that setting only controls the
+        new-opening gate, never whether execution readiness is checked.
+        ``force=True`` bypasses the short TTL cache: immediately before a
         complement FOK the readiness must be freshly validated.
         """
         tmpl = self._template()
         if not (
             tmpl.get("fast_exit_enabled", True)
             and tmpl.get("merge_enabled", True)
-            and tmpl.get("require_merge_ready_for_new_buys", True)
         ):
             return True, ""
         if int(getattr(self.api, "signature_type", -1)) != 3:
@@ -1955,6 +2195,31 @@ class InventoryExitEngine:
         if not force:
             self._readiness_cache = (now, bool(result[0]), str(result[1]))
         return bool(result[0]), str(result[1])
+
+    def new_opening_gate_ready(self) -> tuple[bool, str]:
+        """New Reward BUY opening gate (audit fix pack 2).
+
+        ``require_merge_ready_for_new_buys=false`` may let the gate pass even
+        when Merge execution is not ready — it ONLY controls new openings.
+        Execution safety is a separate concern (merge_execution_ready).
+        """
+        tmpl = self._template()
+        if not (
+            tmpl.get("fast_exit_enabled", True)
+            and tmpl.get("merge_enabled", True)
+            and tmpl.get("require_merge_ready_for_new_buys", True)
+        ):
+            return True, ""
+        return self.merge_execution_ready()
+
+    def merge_runtime_ready(self, force: bool = False) -> tuple[bool, str]:
+        """Back-compat alias: the new-opening gate (not execution readiness)."""
+        if force:
+            # Force is only meaningful for execution safety; the gate itself
+            # always probes when active (its own call has no TTL bypass but the
+            # gate callers never need force).
+            return self.merge_execution_ready(force=True)
+        return self.new_opening_gate_ready()
 
     def _probe_merge_runtime(self) -> tuple[bool, str]:
         """Read-only runtime probe (expected Deposit Wallet + authenticated nonce)."""

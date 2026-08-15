@@ -273,6 +273,7 @@ class Database:
                 held_side TEXT NOT NULL DEFAULT '',
                 held_asset_id TEXT NOT NULL DEFAULT '',
                 held_assets_json TEXT NOT NULL DEFAULT '[]',
+                owned_by_asset_json TEXT NOT NULL DEFAULT '{}',
                 managed_qty REAL NOT NULL DEFAULT 0,
                 initial_qty REAL NOT NULL DEFAULT 0,
                 cost_basis REAL,
@@ -314,6 +315,15 @@ class Database:
                 ON inventory_exit_legs(cycle_id);
             CREATE INDEX IF NOT EXISTS idx_exit_cycles_wallet_status
                 ON inventory_exit_cycles(wallet, status);
+            CREATE TABLE IF NOT EXISTS bot_buy_orders (
+                order_id TEXT PRIMARY KEY,
+                wallet TEXT NOT NULL,
+                condition_id TEXT NOT NULL,
+                asset_id TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_bot_buy_orders_wallet_condition
+                ON bot_buy_orders(wallet, condition_id);
         """
         )
         self.conn.commit()
@@ -399,6 +409,14 @@ class Database:
             c.execute(
                 "ALTER TABLE inventory_exit_cycles "
                 "ADD COLUMN held_assets_json TEXT NOT NULL DEFAULT '[]'"
+            )
+            self.conn.commit()
+        c.execute("PRAGMA table_info(inventory_exit_cycles)")
+        cycle_cols = {row[1] for row in c.fetchall()}
+        if cycle_cols and "owned_by_asset_json" not in cycle_cols:
+            c.execute(
+                "ALTER TABLE inventory_exit_cycles "
+                "ADD COLUMN owned_by_asset_json TEXT NOT NULL DEFAULT '{}'"
             )
             self.conn.commit()
         c.execute("PRAGMA table_info(eligible_markets)")
@@ -1206,6 +1224,7 @@ class Database:
         "merge_recovery", "advantage", "selected_route", "maker_window_until",
         "realized_recovered_collateral", "inventory_pnl", "holding_duration_sec",
         "closed_reason", "error", "opened_at", "closed_at",
+        "held_assets_json", "owned_by_asset_json",
     }
 
     def create_exit_cycle(
@@ -1220,6 +1239,7 @@ class Database:
         cost_basis=None,
         paired_qty=0.0,
         held_assets_json="[]",
+        owned_by_asset_json="{}",
     ):
         """Create one ACTIVE exit cycle, raising ActiveExitCycleExists on duplicates.
 
@@ -1244,9 +1264,9 @@ class Database:
             c.execute(
                 """INSERT INTO inventory_exit_cycles
                 (wallet, condition_id, status, trigger, held_side, held_asset_id,
-                 held_assets_json,
+                 held_assets_json, owned_by_asset_json,
                  managed_qty, initial_qty, cost_basis, paired_qty, opened_at, updated_at)
-                VALUES (?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     wallet,
                     condition_id,
@@ -1254,6 +1274,7 @@ class Database:
                     held_side,
                     held_asset_id,
                     held_assets_json or "[]",
+                    owned_by_asset_json or "{}",
                     float(qty),
                     float(qty),
                     cost_basis,
@@ -1440,6 +1461,47 @@ class Database:
         query += " ORDER BY closed_at, id"
         c.execute(query, params)
         return [dict(row) for row in c.fetchall()]
+
+    # --- Bot Reward BUY order provenance (audit fix pack 2) ---
+
+    def record_bot_buy_order(
+        self, wallet, order_id, condition_id, asset_id, created_at=None
+    ):
+        """Persist a Reward BUY order this application placed (provenance)."""
+        if not order_id:
+            return
+        c = self.conn.cursor()
+        c.execute(
+            """INSERT OR REPLACE INTO bot_buy_orders
+            (order_id, wallet, condition_id, asset_id, created_at)
+            VALUES (?, ?, ?, ?, ?)""",
+            (
+                str(order_id),
+                wallet,
+                condition_id or "",
+                asset_id or "",
+                created_at if created_at is not None else time.time(),
+            ),
+        )
+        self.conn.commit()
+
+    def is_bot_buy_order(self, wallet, order_id) -> bool:
+        if not order_id:
+            return False
+        c = self.conn.cursor()
+        c.execute(
+            "SELECT 1 FROM bot_buy_orders WHERE order_id = ? AND wallet = ? COLLATE NOCASE",
+            (str(order_id), wallet),
+        )
+        return c.fetchone() is not None
+
+    def get_bot_buy_order_ids(self, wallet) -> set:
+        c = self.conn.cursor()
+        c.execute(
+            "SELECT order_id FROM bot_buy_orders WHERE wallet = ? COLLATE NOCASE",
+            (wallet,),
+        )
+        return {str(row["order_id"]) for row in c.fetchall()}
 
     def get_exit_cycles(
         self,

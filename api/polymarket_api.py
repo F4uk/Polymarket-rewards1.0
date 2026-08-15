@@ -946,6 +946,7 @@ _PROXIED_METHODS = (
     "balance_by_sig_types",
     "place_limit_buy",
     "place_limit_sell",
+    "place_post_only_sell",
     "place_market_sell",
     "place_marketable_limit_sell",
     "place_complement_fok_buy",

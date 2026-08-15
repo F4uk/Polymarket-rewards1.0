@@ -13,7 +13,7 @@ import time
 from datetime import datetime, timedelta
 from api.polymarket_api import PolymarketAPI
 from api.proxy import use_proxy
-from config import CATEGORY_CATALOG, PUSH_HOUR
+from config import CATEGORY_CATALOG
 from engine.scanner import MarketScanner, ScanSuperseded
 from engine.monitor import OrderMonitor
 from engine.positions import held_side_info
@@ -25,9 +25,8 @@ from engine.legacy_wall import (
     legacy_price_basis,
     legacy_reason,
 )
-from engine.pnl import beijing_day, beijing_hour, weekly_window
+from engine.pnl import beijing_day
 from engine.pnl_ledger import rebuild_wallet_pnl
-from engine.notify import build_report_payload, send_report
 from utils.crypto import decrypt
 
 logger = logging.getLogger(__name__)
@@ -706,8 +705,6 @@ class EngineManager:
         self._scanner_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._scanner_api: PolymarketAPI | None = None  # Shared API for scanning
-        # 周报「上次推送的本周周一日期」持久化在 DB(db.get/set_last_push_week),重启不重复推。
-        self._pushing = False  # 周报发送在后台线程,此标志防重入(绝不阻塞下单循环)
         self._catalog_cache = None
         self._catalog_cache_ts = 0.0
         self.eligible_markets: list[dict] = []  # Latest scan results
@@ -1044,93 +1041,8 @@ class EngineManager:
                     self._place_round()
                 except Exception as e:
                     logger.error("Place round error: %s", e)
-            self._maybe_push_weekly()
 
             self._stop_event.wait(timeout=place_interval)
-
-    def _maybe_push_weekly(self):
-        """每周 PUSH_HOUR 点后推「最近 7 整天(截止昨天)」盈亏周报到 Telegram(全局一周一次)。
-        目标(token/chat)只在中继 Worker 侧、客户端不持有;始终开启。组装(本地 DB 读,快)在 loop 线程,**发送放后台线程**。
-        节流键=本周周一日期,**持久化在 DB**(`_last_push_week` 内存曾致每次重启重推);过了 PUSH_HOUR、
-        本周还没推、**且台账已爬好(daily_pnl 非空,先统计完再播报)**才推;`_pushing` 防重入。
-        纯外发,不改交易逻辑。整体 try/except、绝不抛进 loop。"""
-        try:
-            if self._pushing:
-                return
-            if time.time() < getattr(self, "_push_retry_after", 0):
-                return  # 上次推送失败,退避期内不重试(见 _send_report)
-            now = time.time()
-            if beijing_hour(now) < PUSH_HOUR:
-                return
-            week_key, week_start, week_end = weekly_window(beijing_day(now))
-            if self.db.get_last_push_week() == week_key:
-                return  # 本周已推(持久化,重启不重复)
-            KEYS = ("reward", "rebate", "sell_profit", "loss", "fee", "net")
-            rows = self.db.get_daily_pnl_all(week_start, week_end)  # 每日(跨钱包)聚合行
-            if not self.db.get_daily_pnl_all(PNL_START_DATE, week_end):
-                return  # 台账还没爬好(daily_pnl 空):先不发,等后台补漏跑完下轮再推,避免发 0
-            by_date = {r["date"]: r for r in rows}
-            daily_nets = []
-            d = datetime.strptime(week_start, "%Y-%m-%d")
-            end = datetime.strptime(week_end, "%Y-%m-%d")
-            while d <= end:
-                ds = d.strftime("%Y-%m-%d")
-                daily_nets.append((ds, by_date.get(ds, {}).get("net", 0.0)))
-                d += timedelta(days=1)
-            week_totals = {k: sum(r.get(k, 0) or 0 for r in rows) for k in KEYS}
-            cum = sum(
-                r["net"] for r in self.db.get_daily_pnl_all(PNL_START_DATE, week_end)
-            )
-            wallets = self.db.list_wallets()
-            per_wallet = []
-            for w in wallets:
-                wr = self.db.get_daily_pnl(w["address"], week_start, week_end)
-                if not any(r.get(k) for r in wr for k in KEYS):
-                    continue  # 本周无任何活动的钱包不列
-                addr = w["address"]
-                label = (w.get("remark") or "").strip() or f"{addr[:6]}...{addr[-4:]}"
-                per_wallet.append({"label": label, "net": sum(r["net"] for r in wr)})
-            payload = build_report_payload(
-                week_start,
-                week_end,
-                daily_nets,
-                week_totals,
-                cum,
-                per_wallet,
-                PNL_START_DATE,
-                [w["address"] for w in wallets],
-            )
-            proxy = (
-                getattr(self._scanner_api, "proxy_url", None)
-                if self._scanner_api
-                else None
-            )
-            self._pushing = True
-            self._push_thread = threading.Thread(
-                target=self._send_report,
-                args=(payload, week_key, proxy),
-                daemon=True,
-                name="pnl-push",
-            )
-            self._push_thread.start()
-        except Exception as e:
-            logger.warning("周报组装失败: %s", e)
-
-    def _send_report(self, payload, week_key, proxy):
-        """后台线程体:把周报 payload 发给中继 Worker。成功才**持久化** last_push_week
-        (失败下轮重试、不阻塞 loop)。send_report 已消毒异常(不带 URL/请求头),故此处
-        WARNING 不泄露 REPORT_KEY。"""
-        try:
-            send_report(payload, proxy)
-            self.db.set_last_push_week(week_key)
-        except Exception as e:
-            # 退避 1 小时再试。这个循环 30 秒一轮,而「持续失败一整周」是设计内的正常状态
-            # (作者按下 Worker 的 ENABLED 急停时就是如此):不退避的话日志会被刷爆(日志文件
-            # 正是用户反馈时发给作者的那个),还会和攻击者一起烧同一份 Cloudflare 免费额度。
-            self._push_retry_after = time.time() + 3600
-            logger.warning("周报推送失败(1 小时内不再重试): %s", e)
-        finally:
-            self._pushing = False
 
     def _active_templates(self) -> list[dict]:
         """所有启用钱包绑定模板(按采集器实际用到的维度去重),供采集器算并集/交集。"""

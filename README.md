@@ -52,9 +52,8 @@ Built for **non-technical users**: install, double-click, a browser opens, you s
 - **账户净值曲线**：引擎运行期间每个钱包每天记一次净值（现金 + 持仓市值），「资产曲线」页看历史走势，也可查任意某天的净值。
 - **全局黑名单**：在下单 / 扫描 / 监控三处统一拦截不想参与的市场。
 - **私钥本地加密**：钱包私钥用 AES-256-GCM 加密，密钥由你的密码经 PBKDF2（60 万次迭代）派生，仅存在于内存。
-- **GitHub 自动更新**：启动时与最新 Release 比对，弹窗 → 下载校验（SHA-256）→ 静默安装重启。
 
-> Gap-tier single-rung placement with per-tier modules keyed by the market's minimum reward size (each module carries its own share count and gating thresholds — a market whose minimum size matches no enabled module is never placed), per-wallet strategy templates, position-driven exit that never sells below a cost reconstructed from real fills, a daily net-worth history per wallet, a global blacklist enforced at three choke points, AES-256-GCM encrypted keys held only in memory, and GitHub Release auto-update.
+> Gap-tier single-rung placement with per-tier modules keyed by the market's minimum reward size (each module carries its own share count and gating thresholds — a market whose minimum size matches no enabled module is never placed), per-wallet strategy templates, position-driven exit that never sells below a cost reconstructed from real fills, a daily net-worth history per wallet, a global blacklist enforced at three choke points, and AES-256-GCM encrypted keys held only in memory.
 
 ---
 
@@ -186,7 +185,7 @@ pytest tests/test_strategy.py     # 单个文件
 4. **厚墙不是 100% 的 v1.0.15**：监控侧的悬崖复查、实时奖励复查、盘口价差复查仍生效。要纯原版行为把 `cliff_probe_cents` 配成 `0`。
 5. **断层单档下实际起作用的主要是规则1 的参数**。分级看整个买单簿，而低价区通常稀疏、容易冒出超过 10¢ 的断层，所以大部分市场归规则1；规则2/3 的门槛虽可配但很少触发，调参先调规则1。
 6. **策略表单的数字框留空表示「这一项不改」**，保存后仍是原值，不是恢复默认。唯一例外是「最长结算天数」，留空表示不限。
-7. **两套模式共用**：选品筛选、品类白名单、预算与敞口封顶、撤改收敛、离场止损、低余额清仓、每钱包代理、盈亏台账与周报。切换只换「挑哪个价、挂几份」。
+7. **两套模式共用**：选品筛选、品类白名单、预算与敞口封顶、撤改收敛、离场止损、低余额清仓、每钱包代理、盈亏台账。切换只换「挑哪个价、挂几份」。
 
 **排查「切了厚墙一单不挂」**：看历史页跳过记录的「原因」列。写「无档达到阈值 2000（扫描范围内最厚 236）」是阈值问题；写「悬崖」是买单下方没支撑被否决；写「按份数模式 custom 算出的份数不足最低份数」是第 3 条那个坑。
 
@@ -258,13 +257,13 @@ powershell -ExecutionPolicy Bypass -File build_installer.ps1
 powershell -ExecutionPolicy Bypass -File release.ps1
 ```
 
-- 版本号唯一来源：`version.py`（被 build / release / 自动更新共同读取）。
+- 版本号唯一来源：`version.py`（被 build / release 共同读取）。
 - 发版需要已安装并登录的 [GitHub CLI](https://cli.github.com/)（`gh auth login`）。
 - 根目录若存在 `RELEASE_NOTES.md` 则作为 Release 说明，否则自动生成。
-- **发版只出 Windows 安装包**（2026-07-28 起）。Linux 服务器模式不需要安装包，更新走 `git fetch --tags` + `git reset --hard <tag>`，只要 tag 推上去即可。
-- **macOS 已停止构建**：`.github/workflows/build-mac.yml` 的 `release published` 自动触发已移除，只留手动触发（Actions 页填 tag 可给某个 Release 补挂 `.dmg`）。停发对客户端安全——`web/update.py` 的 `parse_release` 在 darwin 上找不到 `.dmg` 时判定「无可用更新」，不会报错。
+- **发版只出 Windows 安装包**（2026-07-28 起）。Linux 服务器模式不需要安装包，上游更新按「git fetch -> audit -> merge -> tests -> deploy」手动进行。
+- **macOS 已停止构建**：`.github/workflows/build-mac.yml` 的 `release published` 自动触发已移除，只留手动触发（Actions 页填 tag 可给某个 Release 补挂 `.dmg`）。
 
-> Single source of version truth is `version.py`. `release.ps1` builds the Windows installer locally; Linux updates itself from the pushed git tag and needs no artifact. macOS builds are no longer published (the workflow keeps a manual trigger only).
+> Single source of version truth is `version.py`. `release.ps1` builds the Windows installer locally; macOS builds are no longer published (the workflow keeps a manual trigger only).
 
 ---
 

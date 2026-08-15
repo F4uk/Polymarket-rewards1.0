@@ -47,17 +47,6 @@ ENGINE_DEFAULTS = {
     "reward_scan_max_pages": 20,
 }
 
-# 周报中继(Cloudflare Worker)。Telegram token/chat 只存在 Worker 的环境变量里,客户端
-# 一概不知道。写死在这里的两个值会随源码上 GitHub,**都不是秘密**:
-#   REPORT_URL  Worker 地址,公开可见
-#   REPORT_KEY  只用来把随机扫描 workers.dev 的爬虫挡在门外,不是鉴权凭证
-# 真正的防线是 Worker 侧的 ENABLED 止损开关(设成 "0"、几十秒传播延迟,按下后要发一次测试
-# 请求、收到 503 才算停住,不用发版),以及「改 Worker 不用发版」这件事本身。
-# 历史:上一版把 bot token 写死在这里,被人从公开仓库扒走盗用(2026-07-27),已 revoke。
-REPORT_URL = "https://polymarket-profit.lgldppst.workers.dev"
-REPORT_KEY = "316e1800a8e77780d39523fc77cff12b"
-PUSH_HOUR = 9  # 北京时间几点后推(8点奖励到账之后)
-
 # 策略级参数:每钱包/每模板取值,存 template_settings 表。
 TEMPLATE_DEFAULTS = {
     "min_reward_usd": 100.0,

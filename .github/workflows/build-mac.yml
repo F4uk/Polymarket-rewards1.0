@@ -7,7 +7,7 @@ name: Build macOS app
 # Release 补 .dmg，去 Actions 页手动跑本工作流并填 release_tag 即可；要恢复
 # 自动发布就把那两行 trigger 加回来。
 #
-# 停发 Mac 对客户端是安全的：web/update.py 的 parse_release 在 darwin 上找
+# 停发 Mac：客户端已移除运行时自动更新,仅保留手动触发构建
 # 不到 .dmg 时 pkg_url 为 None，检查更新会判定「无可用更新」而不是报错。
 # 不做 Apple 签名/公证：用户首次需右键→打开（README 有说明）。
 

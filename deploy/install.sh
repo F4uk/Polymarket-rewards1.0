@@ -31,7 +31,8 @@ mkdir -p "$BASE"
 chown -R pmm:pmm "$BASE"
 
 echo "==> 克隆代码"
-# 必须是 git clone(而不是下载 zip):网页上的「更新」按钮靠 git fetch/reset 工作。
+# 必须是 git clone(而不是下载 zip):上游更新按「git fetch -> audit -> merge -> tests ->
+# deploy」手动进行,保留 .git 才能 fetch 上游新提交。
 if [ ! -d "$APP/.git" ]; then
 	sudo -H -u pmm git clone "$REPO" "$APP"
 fi

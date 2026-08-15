@@ -30,7 +30,6 @@ from engine.market_links import enrich_with_market_meta, ensure_market_meta
 from engine.blacklist_ops import buy_order_ids_for_condition
 from engine.take_profit import effective_theta_stop
 from config import DB_PATH, HOST, PORT, SERVER_MODE
-from web import update as updater
 from web.wallet_import import ImportJob, parse_import_lines
 from version import __version__
 
@@ -1502,30 +1501,3 @@ def api_dashboard():
             "templates_without_tiers": templates_without_tiers,
         }
     )
-
-
-# --- API: 自动更新(check 免登录,apply/status 需登录) ---
-# check 只读固定 GitHub URL 的版本号,带 30 分钟 TTL 缓存,不改变任何状态也不
-# 泄露钱包信息,登录页/设置页底部的"检查更新"链接需要它在未登录时也能用;
-# apply(拉代码+重启进程)和 status 会影响进程/暴露运行状态,必须登录后才能用。
-
-
-@app.route("/api/update/check", methods=["GET"])
-def api_update_check():
-    result = updater.check_update()
-    # apply 需要登录;未登录时前端不该展示"现在更新"按钮(点了也只会被重定向)
-    result["logged_in"] = bool(session.get("logged_in"))
-    return jsonify(result)
-
-
-@app.route("/api/update/apply", methods=["POST"])
-@login_required
-def api_update_apply():
-    result = updater.start_update(manager)
-    return jsonify(result), (200 if result.get("ok") else 409)
-
-
-@app.route("/api/update/status", methods=["GET"])
-@login_required
-def api_update_status():
-    return jsonify(updater.STATE.snapshot())

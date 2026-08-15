@@ -310,23 +310,6 @@ class Database:
         row = c.fetchone()
         return json.loads(row["value"]) if row else None
 
-    def set_last_push_week(self, week_key: str):
-        """持久化周报「上次推送的本周周一日期」(保留键,不进 get_settings 的 ENGINE_DEFAULTS)。
-        重启后据此判断本周是否已推,避免每次启动引擎都重复推。"""
-        c = self.conn.cursor()
-        c.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-            ("last_push_week", json.dumps(week_key)),
-        )
-        self.conn.commit()
-
-    def get_last_push_week(self):
-        """读上次周报推送的周键(本周周一日期);从没推过返回 None。"""
-        c = self.conn.cursor()
-        c.execute("SELECT value FROM settings WHERE key = ?", ("last_push_week",))
-        row = c.fetchone()
-        return json.loads(row["value"]) if row else None
-
     # --- Templates ---
 
     DEFAULT_TEMPLATE_NAME = "默认"

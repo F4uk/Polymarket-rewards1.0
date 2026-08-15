@@ -24,20 +24,15 @@ The app can also run on a Linux VPS behind a domain + HTTPS (`deploy/README.md`,
 `docs/superpowers/specs/2026-07-27-vps-deployment-design.md`). A single env var,
 `PMM_SERVER=1`, switches on all server-only behavior: no `webbrowser.open`, fixed port (no
 `pick_port` fallback — the reverse proxy hardcodes it), waitress instead of the Flask dev
-server, and a git-based update path instead of downloading a `.exe`/`.dmg`. **It must stay
+server. **It must stay
 single-process** — `web/routes.py` holds `db`/`manager`/`encryption_key` as module globals and
 the engine runs as in-process threads, so a multi-worker WSGI server would run two engines
 over the same wallets. Flask still binds `127.0.0.1` only; Caddy terminates TLS and proxies to
 it. `ProxyFix(x_for=1)` recovers the real client IP for login rate limiting (5 failures per IP
 → 15 min lock) — without it every request looks like `127.0.0.1` and the limiter degrades into
-a global lock anyone can trip. `/api/update/apply` and `/api/update/status` require login (one
-can restart the process, the other exposes update progress); `/api/update/check` stays
-unauthenticated on purpose — the login page's "检查更新" link needs it reachable before login,
-and it only reads a version number from GitHub through a 30-minute-TTL cache, so it changes no
-state and leaks no wallet info. The server-mode update (`_run_git_update` in `web/update.py`)
-syncs to the release tag, installs deps, then exits for systemd to restart; any failure — including
-exceptions raised mid-update, not just a failed step — rolls back to the pre-update commit and
-leaves the process running.
+a global lock anyone can trip. **The app never self-updates** (no runtime updater, no release
+download, no git reset): upstream changes are applied manually via `git fetch -> audit ->
+merge -> tests -> deploy` (see `deploy/README.md`).
 
 ## Architecture
 
@@ -87,24 +82,11 @@ market the wallet is still cooling down on, which the dropout pass skips.
 
 **Per-wallet HTTP proxy (`api/proxy.py`).** Each wallet can carry its own proxy (`wallets.proxy` column, **plaintext**; entered as `host:port[:user:pass]` in the wallet config UI, `parse_proxy` turns it into `http://user:pass@host:port`); `PolymarketAPI(proxy=...)` then routes **all** of that wallet's network egress through it for IP isolation. The hard part: `py-clob-client-v2` makes every CLOB call through a **process-global** `httpx.Client` (`http_helpers/helpers._http_client`) with no per-instance proxy, and the *same* `PolymarketAPI` is used from two threads (the shared scanner thread places orders; the wallet's monitor thread runs `_tick`) — so the proxy can't be thread-local. The fix is a `contextvars.ContextVar` (`current_proxy`): `install_clob_proxy()` (idempotent, called in `PolymarketAPI.__init__`) swaps the global `_http_client` for a dispatcher that picks/caches a per-proxy `httpx.Client(proxy=...)` by `current_proxy.get()`, and the 9 `requests.get` calls become `http_get` (injects `proxies=` from the same contextvar). Who **sets** the contextvar: every instance network method is wrapped (`_PROXIED_METHODS` loop applies `_proxied`, reading `self.proxy_url`) so CLOB/Data calls self-route regardless of caller (routes, workers); the **static** rewards/gamma helpers carry no wallet identity and instead rely on operation boundaries that set the ambient proxy — `_worker_proxied` on `WalletWorker._tick`/`place_orders`, and a `use_proxy(...)` around the scanner's `fetch_candidates` (so discovery + manual scan use the *scanning* wallet's proxy; orderbook fetches already self-route via the scanner-wallet `PolymarketAPI`). **No fallback to direct:** if a proxy is down the call raises and that wallet's round is skipped — we never leak the real IP. A wallet with no proxy configured (`proxy_url=None`) connects directly (the dispatcher's `None` key reuses the original client), so non-proxied behavior is unchanged. **HTTP and SOCKS5 are both supported** (`socksio` for httpx, `PySocks` for requests — both are lazy imports, hence the explicit `hiddenimports` in the PyInstaller spec — and note that a `hiddenimports` entry for a package **not installed in the build environment** silently collects nothing (PyInstaller only records it in `build/*/warn-*.txt` as "missing module named ..."). The Windows package is built on the maintainer's own machine, not in CI, so `pip install -r requirements.txt` must actually be current there or the installer ships without those lazy imports; every Windows build up to v8.2.0 went out without `socksio`, which silently broke SOCKS5 proxies for the packaged app since all CLOB traffic goes through httpx. Both spec files are covered by `*.spec` in `.gitignore` and are in the repo only because they were `git add -f`'d — check `git ls-files "*.spec"` after touching them, or the change lives on one machine only (`MarketMaker.spec` was untracked until 2026-07-30 for exactly this reason)). The user doesn't know which protocol their provider handed them (iproyal's datacenter IPs, for instance, only speak SOCKS5 even though the credentials look identical), so they still type just `host:port[:账户:密码]` and `probe_proxy` (called by `api_add_wallet` / `api_set_wallet_proxy`, **not** by the engine) settles it at save time: try HTTP, then SOCKS5, whichever reaches `clob.polymarket.com/ok` wins, and the winning protocol is written back into the stored string as a `socks5:` prefix so the runtime never guesses. SOCKS5 always resolves to `socks5h://` (**remote DNS**) — `socks5://` resolves the hostname locally, which leaks DNS from the real IP and in practice got refused by the tested proxies. A proxy that answers neither is **rejected at save time** (400, nothing written): storing an unreachable proxy would silently park that wallet forever, since there is no fallback to direct. The save response carries the detected protocol and the exit IP (best-effort via ipify; a failed lookup doesn't fail the save) so the UI can confirm IP isolation.
 
-**Weekly report push goes through a relay, never Telegram directly.** `engine/notify.py`
-POSTs a structured payload (numbers only, no prose) to a Cloudflare Worker
-(`deploy/report-worker.js`); the Worker holds the Telegram bot token in its own env vars
-and renders the message text itself. The client never sees the token or the chat id — an
-earlier version hardcoded the token in `config.py`, it was scraped from the public repo and
-abused (2026-07-27, token since revoked). `REPORT_URL` / `REPORT_KEY` in `config.py` ship
-with the source and are **not secrets**: the real control is the Worker's `ENABLED` kill
-switch (set it to `0`; propagation takes tens of seconds, not instant — after flipping it, send one test request and confirm you get a 503 before considering it stopped; no client release needed). The
-wallet-address allowlist (`ALLOW`) is **optional and empty by default** — the author does
-not know which wallets the users run and they add and remove them freely, so requiring a
-registry would be unmaintainable and would silently break the report whenever someone adds
-a wallet; fill it only when tightening after an incident. Two invariants the Worker must keep: every string that
-reaches the message is either a date matched against `^\d{4}-\d{2}-\d{2}$` (whole request
-rejected otherwise) or a `label` stripped of control characters and truncated to 20 chars —
-`label` is a user-editable wallet remark, i.e. free text, and skipping that step hands back
-the "make the bot say anything" capability the incident was about. Never move the message
-rendering back to the client to avoid the duplication: that is what makes the payload
-un-abusable.
+**No author/relay reporting.** All PnL, balances and trading statistics stay local (daily
+ledger in SQLite, `盈亏台账` UI). There is no weekly push, no Telegram relay, no Cloudflare
+Worker and no `REPORT_URL`/`REPORT_KEY` anywhere in the codebase — wallet addresses, PnL
+numbers and balances are never transmitted to author-controlled services. `tests/test_no_telemetry.py`
+scans the runtime code so any reintroduction fails CI.
 
 ## Critical behaviors to preserve
 

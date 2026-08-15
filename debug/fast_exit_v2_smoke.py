@@ -96,13 +96,14 @@ class FakeAPI:
         return [t for values in self.trades.values() for t in values]
 
 
-def sell_fill(asset, qty, price, ts):
+def sell_fill(asset, qty, price, ts, side="SELL", order_id="o"):
     return {
         "trade_id": f"t-{asset}-{ts}",
         "maker_orders": [
             {
+                "order_id": order_id,
                 "maker_address": "0xfunder",
-                "side": "SELL",
+                "side": side,
                 "asset_id": asset,
                 "price": str(price),
                 "matched_amount": str(qty),
@@ -187,6 +188,7 @@ def main():
     )
     api.positions = [pos("NO", 50, "no")]
     eng = engine(db, api, {"no": 0.30})
+    db.record_bot_buy_order("0xW", "o", CID, "no")
     eng.on_reward_fill(fill("no", 50, price=0.30))
     eng.run_tick(open_orders=[], positions=[pos("NO", 50, "no")])
     check(
@@ -205,6 +207,7 @@ def main():
     )
     api2.positions = [pos("NO", 50, "no")]
     eng2 = engine(db2, api2, {"no": 0.30})
+    db2.record_bot_buy_order("0xW", "o", CID, "no")
     eng2.on_reward_fill(fill("no", 50, price=0.30))
     eng2.run_tick(open_orders=[], positions=[pos("NO", 50, "no")])
     window_ok = api2.placed_post_only_sells == [("no", 0.29, 50)] and api2.placed_market == []
@@ -228,6 +231,13 @@ def main():
     )
     api3.positions = [pos("YES", 30, "yes"), pos("NO", 20, "no")]
     eng3 = engine(db3, api3, {"yes": 0.30})
+    # bot-order provenance for adoption (audit fix pack 2)
+    db3.record_bot_buy_order("0xW", "o-y", CID, "yes")
+    db3.record_bot_buy_order("0xW", "o-n", CID, "no")
+    api3.trades[CID] = [
+        sell_fill("yes", 30, 0.30, ts=100, side="BUY", order_id="o-y"),
+        sell_fill("no", 20, 0.30, ts=100, side="BUY", order_id="o-n"),
+    ]
     eng3.run_tick(open_orders=[], positions=[pos("YES", 30, "yes"), pos("NO", 20, "no")])
     cyc3 = db3.get_active_exit_cycle("0xW", CID)
     pair_ok = cyc3["paired_qty"] == 20 and api3.placed_sells == []
@@ -269,6 +279,7 @@ def main():
     eng5 = engine(db5 := Database(os.path.join(tmp, "s5.db")), api5, {})
     db5.init()
     template(db5)
+    db5.record_bot_buy_order("0xW", "o", CID, "no")
     eng5.on_reward_fill(fill("no", 20, price=0.32))
     same = eng5.authorize_placement(CID, "no", "NO", 50, [])
     check(

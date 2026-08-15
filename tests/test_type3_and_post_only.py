@@ -49,6 +49,30 @@ def test_v2_maker_escape_sell_is_gtc_post_only(mock_clob, _safe):
 
 @patch("api.polymarket_api.derive_deposit_address", return_value="0xSafe")
 @patch("api.polymarket_api.ClobClient")
+def test_v2_maker_escape_sell_runs_inside_wallet_proxy(mock_clob, _safe):
+    # Fix pack 2: place_post_only_sell must receive the same per-wallet proxy
+    # context as every other wallet network method.
+    from api.proxy import current_proxy
+
+    client = MagicMock()
+    client.get_address.return_value = "0xEOA"
+    mock_clob.return_value = client
+    api = PolymarketAPI(
+        "0x" + "1" * 64, signature_type=2, funder=None, proxy="h:1000:u:p"
+    )
+    seen = {}
+
+    def record(*a, **kw):
+        seen["proxy"] = current_proxy.get()
+        return {"success": True, "orderID": "o-1"}
+
+    client.create_and_post_order.side_effect = record
+    api.place_post_only_sell("token", 0.29, 10)
+    assert seen["proxy"] == "http://u:p@h:1000"
+
+
+@patch("api.polymarket_api.derive_deposit_address", return_value="0xSafe")
+@patch("api.polymarket_api.ClobClient")
 def test_rejected_post_only_does_not_fallback(mock_clob, _safe):
     api, client = _api(mock_clob)
     client.create_and_post_order.return_value = {"success": False, "errorMsg": "crosses"}

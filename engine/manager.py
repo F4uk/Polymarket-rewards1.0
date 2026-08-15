@@ -542,8 +542,28 @@ class WalletWorker:
                     cancel_reason = "库存退出中·同侧禁买:" + authority["reason"]
                     cancel_action = "exit_inventory_cancel"
                 elif authority is not None and authority.get("kind") == "opposite_cap":
-                    # 对侧已达残差上限:保留在挂买单(可成交补成完整集合),不挂新单。
-                    continue
+                    # Audit fix D: 对侧 Reward BUY 的「总量目标」语义——总在挂量
+                    # 必须 <= 当前未配对残差。desired = min(残差, max(提议, 在挂)):
+                    # 残差收缩时把在挂量收敛下来、残差为 0 时撤光、残差充足时按提议
+                    # 补到目标总量。reconcile_buy_orders 负责撤改到目标 ladder。
+                    residual = float(authority.get("residual", 0) or 0)
+                    open_total = float(authority.get("open_qty", 0) or 0)
+                    proposal_total = sum(
+                        float(s) for _p, s in ladders.get(key, [])
+                    )
+                    desired = min(residual, max(proposal_total, open_total))
+                    capped = []
+                    remaining = desired
+                    for price, shares in ladders.get(key, []):
+                        take = min(float(shares), remaining)
+                        if take > 0:
+                            capped.append((price, take))
+                        remaining -= take
+                        if remaining <= 0:
+                            break
+                    cancel_ids, to_place = reconcile_buy_orders(capped, resting)
+                    cancel_reason = "对侧 Reward BUY 总量收敛到未配对残差:" + authority["reason"]
+                    cancel_action = "opposite_cap_reconcile"
                 elif token_id in held_assets or self.db.is_side_paused(
                     self.wallet_address, mid, token_id
                 ) is True:
@@ -552,22 +572,6 @@ class WalletWorker:
                     cancel_reason = "成交后单侧暂停:撤掉该侧全部买单,直至该侧持仓平掉"
                     cancel_action = "side_pause_cancel"
                 elif budget_ok:
-                    if (
-                        authority is not None
-                        and authority.get("effective_qty") is not None
-                    ):
-                        # 对侧 Reward BUY 上限:clamp 到残差,保持累计不超。
-                        cap = float(authority["effective_qty"])
-                        capped = []
-                        remaining = cap
-                        for price, shares in ladders.get(key, []):
-                            take = min(float(shares), remaining)
-                            if take > 0:
-                                capped.append((price, take))
-                            remaining -= take
-                            if remaining <= 0:
-                                break
-                        ladders[key] = capped
                     cancel_ids, to_place = reconcile_buy_orders(
                         ladders.get(key, []), resting
                     )

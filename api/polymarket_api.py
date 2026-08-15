@@ -448,6 +448,38 @@ class PolymarketAPI:
         res = self.client.create_and_post_order(order_args, options, OrderType.GTC)
         return _check_order_resp(res, "限价卖单")
 
+    def place_post_only_sell(
+        self,
+        token_id: str,
+        price: float,
+        size: int,
+        tick_size: str = "0.01",
+        neg_risk: bool | None = None,
+    ) -> dict:
+        """GTC + POST-ONLY limit sell for the V2 maker escape window.
+
+        The V2 maker escape must never accidentally become a taker order: if
+        the snapshot moved and the proposed SELL would cross, the CLOB rejects
+        it (acceptable) instead of falling back to a marketable order.  Legacy
+        take-profit sells keep their existing (non-post-only) semantics; this
+        narrow method is used only by the Inventory Exit Engine.
+        """
+        self._require_trading_enabled()
+        order_args = OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=float(size),
+            side="SELL",
+        )
+        options = PartialCreateOrderOptions(
+            tick_size=tick_size,
+            neg_risk=neg_risk,
+        )
+        res = self.client.create_and_post_order(
+            order_args, options, OrderType.GTC, post_only=True
+        )
+        return _check_order_resp(res, "限价卖单(Post-Only)")
+
     def place_market_sell(
         self,
         token_id: str,

@@ -1784,6 +1784,8 @@ def api_dashboard():
     by_method = {m: 0.0 for m in EXIT_METHODS}
     fill_count_today = 0
     for leg in legs_since:
+        if leg.get("status") not in ("confirmed", "done"):
+            continue  # order intent / pending legs never count as realized
         method = leg.get("exit_method")
         if method in by_method:
             by_method[method] += float(leg.get("collateral", 0) or 0)
@@ -1837,11 +1839,15 @@ def api_dashboard():
             },
         )
         legs = db.get_exit_legs(cycle["id"])
+        confirmed = [
+            leg for leg in legs
+            if leg.get("status") in ("confirmed", "done")
+        ]
         entry["inventory_pnl"] += sum(
-            float(leg.get("collateral", 0) or 0) for leg in legs
+            float(leg.get("collateral", 0) or 0) for leg in confirmed
         )
         entry["fill_count"] += sum(
-            1 for leg in legs if leg.get("kind") == "reward_buy"
+            1 for leg in confirmed if leg.get("kind") == "reward_buy"
         )
         if cycle["status"] == "CLOSED":
             entry["closed_count"] += 1

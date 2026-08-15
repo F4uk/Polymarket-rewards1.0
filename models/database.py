@@ -272,6 +272,7 @@ class Database:
                 trigger TEXT NOT NULL DEFAULT 'reward_fill',
                 held_side TEXT NOT NULL DEFAULT '',
                 held_asset_id TEXT NOT NULL DEFAULT '',
+                held_assets_json TEXT NOT NULL DEFAULT '[]',
                 managed_qty REAL NOT NULL DEFAULT 0,
                 initial_qty REAL NOT NULL DEFAULT 0,
                 cost_basis REAL,
@@ -392,6 +393,14 @@ class Database:
             self.conn.commit()
         except sqlite3.IntegrityError:
             self.conn.rollback()
+        c.execute("PRAGMA table_info(inventory_exit_cycles)")
+        cycle_cols = {row[1] for row in c.fetchall()}
+        if cycle_cols and "held_assets_json" not in cycle_cols:
+            c.execute(
+                "ALTER TABLE inventory_exit_cycles "
+                "ADD COLUMN held_assets_json TEXT NOT NULL DEFAULT '[]'"
+            )
+            self.conn.commit()
         c.execute("PRAGMA table_info(eligible_markets)")
         em_cols = {row[1] for row in c.fetchall()}
         if em_cols and "min_cost" not in em_cols:
@@ -1210,6 +1219,7 @@ class Database:
         opened_at=None,
         cost_basis=None,
         paired_qty=0.0,
+        held_assets_json="[]",
     ):
         """Create one ACTIVE exit cycle, raising ActiveExitCycleExists on duplicates.
 
@@ -1234,14 +1244,16 @@ class Database:
             c.execute(
                 """INSERT INTO inventory_exit_cycles
                 (wallet, condition_id, status, trigger, held_side, held_asset_id,
+                 held_assets_json,
                  managed_qty, initial_qty, cost_basis, paired_qty, opened_at, updated_at)
-                VALUES (?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     wallet,
                     condition_id,
                     trigger,
                     held_side,
                     held_asset_id,
+                    held_assets_json or "[]",
                     float(qty),
                     float(qty),
                     cost_basis,
@@ -1392,6 +1404,41 @@ class Database:
             "SELECT * FROM inventory_exit_legs WHERE cycle_id = ? ORDER BY created_at, id",
             (cycle_id,),
         )
+        return [dict(row) for row in c.fetchall()]
+
+    _EXIT_LEG_UPDATE_COLUMNS = {
+        "kind", "exit_method", "asset_id", "side", "qty", "price",
+        "collateral", "pnl", "order_id", "relayer_id", "status", "note",
+    }
+
+    def update_exit_leg(self, leg_id, **fields):
+        """Whitelisted leg column update (realized fill reconciliation)."""
+        allowed = {
+            k: v for k, v in fields.items() if k in self._EXIT_LEG_UPDATE_COLUMNS
+        }
+        if not allowed:
+            return
+        sets = ", ".join(f"{k} = ?" for k in allowed)
+        c = self.conn.cursor()
+        c.execute(
+            f"UPDATE inventory_exit_legs SET {sets} WHERE id = ?",
+            (*allowed.values(), leg_id),
+        )
+        self.conn.commit()
+
+    def get_ledger_pending_exit_cycles(self, wallet=None) -> list[dict]:
+        """CLOSED cycles whose exit legs still await fill reconciliation."""
+        c = self.conn.cursor()
+        query = (
+            "SELECT * FROM inventory_exit_cycles "
+            "WHERE status = 'CLOSED' AND error LIKE 'LEDGER_PENDING:%'"
+        )
+        params: list = []
+        if wallet:
+            query += " AND wallet = ? COLLATE NOCASE"
+            params.append(wallet)
+        query += " ORDER BY closed_at, id"
+        c.execute(query, params)
         return [dict(row) for row in c.fetchall()]
 
     def get_exit_cycles(

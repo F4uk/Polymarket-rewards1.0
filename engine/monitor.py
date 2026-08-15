@@ -142,6 +142,7 @@ class OrderMonitor:
                 condition_lock=self._condition_lock,
                 cost_provider=self._cost_lots,
                 book_provider=self._engine_book,
+                trades_provider=self._engine_trades,
                 status_add=self._status_add,
                 record_action=self._record_action,
             )
@@ -153,6 +154,15 @@ class OrderMonitor:
             return self._book_cache[asset_id]
         try:
             return self.api.get_orderbook(asset_id)
+        except Exception:
+            return None
+
+    def _engine_trades(self, condition_id: str):
+        """get_trades for the exit engine: per-tick prefetch cache first."""
+        if condition_id in self._trades_by_cid:
+            return self._trades_by_cid[condition_id]
+        try:
+            return self.api.get_trades(TradeParams(market=condition_id))
         except Exception:
             return None
 

@@ -16,3 +16,4 @@ installer/
 
 .worktrees/
 .superpowers/
+.venv/
